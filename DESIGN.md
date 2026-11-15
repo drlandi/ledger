@@ -207,34 +207,37 @@ Uniform traffic over 1024 accounts:
 
 | threads | global lock | per-account locks | ratio |
 |---:|---:|---:|---:|
-| 1 | 5,740,404 | 3,907,484 | 0.68x |
-| 2 | 1,115,095 | 3,120,250 | 2.80x |
-| 4 | 1,372,247 | 4,136,883 | 3.01x |
-| 8 | 1,517,545 | 4,165,507 | 2.74x |
+| 1 | 3,578,089 | 3,033,960 | 0.85x |
+| 2 | 1,095,747 | 2,825,295 | 2.58x |
+| 4 | 1,151,296 | 4,502,880 | 3.91x |
+| 8 | 1,225,545 | 4,115,066 | 3.36x |
 
 80% of traffic on 2 hot accounts:
 
 | threads | global lock | per-account locks | ratio |
 |---:|---:|---:|---:|
-| 1 | 4,566,393 | 3,934,083 | 0.86x |
-| 2 | 1,184,354 | 1,216,770 | 1.03x |
-| 4 | 1,296,513 | 659,616 | 0.51x |
-| 8 | 1,323,552 | 565,424 | 0.43x |
+| 1 | 3,472,291 | 3,255,081 | 0.94x |
+| 2 | 974,608 | 1,386,881 | 1.42x |
+| 4 | 1,374,951 | 667,905 | 0.49x |
+| 8 | 1,208,245 | 559,679 | 0.46x |
+
+(Numbers from the final run of `make bench`; runs vary by 10-20% on
+this shared VM, the ordering of the designs does not.)
 
 What the numbers say, without spin:
 
 1. Single-threaded, the global lock wins (one uncontended mutex
    instead of three). Fine-grained locking has a fixed price.
 2. With uniform traffic and more than one thread, per-account locks
-   are about 3x faster. The global lock gets *slower* with threads
-   (5.7M -> 1.1M): every transfer bounces the same lock between cores.
+   are 2.6x to 3.9x faster. The global lock gets *slower* with threads
+   (3.6M -> 1.1M): every transfer bounces the same lock between cores.
 3. With traffic concentrated on two accounts, per-account locks are
-   the *worse* design (0.43x at 8 threads). The hot accounts' locks are
+   the *worse* design (0.46x at 8 threads). The hot accounts' locks are
    a global lock in disguise, and each transfer now pays for three
    locks and sleeps on a contended one while still holding its shard
    lock. Fine-grained locking only helps when the workload actually
    spreads out.
-4. Per-account locking does not scale beyond ~4M/s here, and the cause
+4. Per-account locking does not scale beyond ~4.5M/s here, and the cause
    is not locking. Investigation: the 2-thread run spends 1.15 s in
    the kernel against 0.18 s single-threaded, with only ~5,000 futex
    calls per million transfers (`strace -c`) and an identical number
@@ -395,15 +398,18 @@ ledger was created to the shared checker. On top of I1-I6 it requires
 that C and the Python reader agree on where the valid log ends and
 that recovery never cuts below a durable offset.
 
-Long run, `python3 tests/crash_harness.py --iterations 1000 --threads 64 --seed 2026`:
+Long run on the final code, `make crash-long`
+(`python3 tests/crash_harness.py --iterations 1000 --threads 64`):
 
 ```
-crash harness: 1000 kill -9, sync=full, 64 threads, 107 s
-  transfers that survived in the logs : 1129280
-  transfer calls that returned        : 2076123 (OK=1116204, DUPLICATE=891023, INSUFFICIENT_FUNDS=57547, INVALID=11349)
-  tail damage injected                : append=175, flip=113, none=394, truncate=109, truncate+append=103, truncate_to_floor=106
-  bytes of torn tail cut by recovery  : 227162
+crash harness: 1000 kill -9, sync=full, 64 threads, 112 s
+  transfers that survived in the logs : 1269501
+  transfer calls that returned        : 2352372 (OK=1257390, DUPLICATE=1020254, INSUFFICIENT_FUNDS=59895, INVALID=14833)
+  tail damage injected                : append=136, flip=125, none=383, truncate=113, truncate+append=125, truncate_to_floor=118
+  bytes of torn tail cut by recovery  : 243509
   I1-I6 held after every recovery     : yes (1000 of 1000)
+RESULT: 1,269,501 transfers committed by 64 threads across 1000 kill -9 crashes;
+        after every one of the 1000 recoveries all six invariants held.
 ```
 
 `make mutants`: 17 more planted bugs, all killed (41/41 in total).
@@ -455,6 +461,69 @@ Found while breaking it:
   their predecessor, so such a record would be accepted if the rules
   allow it.
 
+## 7. Packaging and evidence (M4)
+
+- CLI `build/ledger` (`cli/ledger_cli.c`): `create`, `transfer`,
+  `balance`, `verify`, plus `dump` for the tests. Numbers are parsed
+  strictly (whole string, in range, never as floating point); tested
+  with `1.5`, `1e3`, `0x10`, 2^63, padded strings.
+- `make demo`: the crash harness with 64 threads, kill delays of
+  150-450 ms, 400 kills. Result on the reference machine:
+
+```
+Running 400 rounds of: 64 threads transfer money, kill -9, damage the log tail, recover, check.
+crash harness: 400 kill -9, sync=full, 64 threads, 146 s
+  transfers that survived in the logs : 2350072
+  transfer calls that returned        : 4664377 (OK=2344812, DUPLICATE=2204102, INSUFFICIENT_FUNDS=62698, INVALID=52765)
+  tail damage injected                : append=51, flip=49, none=159, truncate=52, truncate+append=38, truncate_to_floor=51
+  bytes of torn tail cut by recovery  : 67575
+  I1-I6 held after every recovery     : yes (400 of 400)
+RESULT: 2,350,072 transfers committed by 64 threads across 400 kill -9 crashes;
+        after every one of the 400 recoveries all six invariants held.
+```
+
+- `make bench`: the tables in section 5 and the durable throughput
+  below (log on, per-account locks, 64 accounts, 40,000 transfers per
+  run, median of 3):
+
+| threads | sync=process | sync=full | transfers per fdatasync |
+|---:|---:|---:|---:|
+| 1 | 1,576,703 | 7,447 | 1.0 |
+| 4 | 133,976 | 12,786 | 2.4 |
+| 16 | 187,344 | 27,122 | 8.4 |
+| 64 | 166,353 | 49,223 | 27.5 |
+| 256 | 171,357 | 60,704 | 46.8 |
+
+  `sync=full` scales with client threads because of group commit: one
+  transfer per flush with 1 thread, ~47 per flush with 256.
+  `sync=process` is the opposite: 1.58M/s alone, ~170,000/s with
+  several threads, because each waiter performs its own tiny `write()`
+  and the log lock is handed from thread to thread. Not tuned.
+- A fresh clone was built and tested from scratch (see STATUS).
+
+## 8. Property test with shrinking (M5, stretch)
+
+`make test-property` (optional, needs `hypothesis`) states the same
+property as `test_diff.py` but lets hypothesis generate and *shrink*
+the sequences. Against the planted off-by-one in the funds check it
+reports this minimal case instead of "seed 673, operation 172":
+
+```
+ops=[('c', 0, 1), ('c', 2, 0), ('t', 0, 1, 0, 2)]
+     bank          2 cents       move exactly 2 cents out -> wrongly refused
+```
+
+Found while building it: the first two versions of the strategy
+passed against that same planted bug, even with 3000 examples.
+Measured cause: independent random draws produced a *successful*
+transfer in under 1% of cases, so the funds check was never at its
+boundary. The strategy now starts every case with funded accounts and
+uses small amounts. Lesson kept in the file's comments: a generator
+has to be checked against a known bug, exactly like any other test.
+
+No TLA+ model was written; the lock-order and log-order arguments in
+sections 5 and 6 are prose, not machine-checked.
+
 ## Decision log
 
 | # | Decision | Chosen | Rejected | Why |
@@ -468,7 +537,7 @@ Found while breaking it:
 | D7 | Codes beyond the brief's five | `FULL` (account table full), `ERROR` (I/O or memory; see M3), `CORRUPT` (log fails validation) | Overloading `INVALID` | These describe the environment, not the request. Mixing them would hide real faults. |
 | D8 | Idempotency table | Sharded open-addressing hash table, grows by doubling, never forgets | Sorted array; one big table; expiring keys | O(1) lookups, and the shards give M2 a natural lock unit. Never forgetting keys means memory grows with history (32 bytes per transfer); a real system would expire keys by age. Listed as a limitation. |
 | D9 | How to test the tests | Mutation check (`make mutants`) | Trusting coverage numbers | A test that cannot fail proves nothing. Planting known bugs and requiring a failure measures exactly that. |
-| D10 | Locking | Shard lock for the id, then per-account locks in ascending id order | (a) One global lock: simplest and fastest single-threaded, but measured 3x slower with uniform multi-threaded traffic. (b) Lock-free CAS on balances: cannot update two balances atomically without a transaction scheme. (c) try-lock and back off: livelock risk and harder to reason about than a fixed order. | Deadlock freedom follows from a one-line ordering rule that can be explained and checked. Measured trade-offs are in section 5, including the workload where this choice loses. |
+| D10 | Locking | Shard lock for the id, then per-account locks in ascending id order | (a) One global lock: simplest and fastest single-threaded, but measured about 3x slower with uniform multi-threaded traffic. (b) Lock-free CAS on balances: cannot update two balances atomically without a transaction scheme. (c) try-lock and back off: livelock risk and harder to reason about than a fixed order. | Deadlock freedom follows from a one-line ordering rule that can be explained and checked. Measured trade-offs are in section 5, including the workload where this choice loses. |
 | D11 | Hold the shard lock for the whole transfer | Yes | Reserve the id, release, apply, then confirm | A reservation needs an "in progress" state and a way for a concurrent duplicate to wait for it. Holding the lock is correct by construction; with 1024 shards the extra contention is small. |
 | D12 | Consistent snapshot | Lock every account in order | A reader-writer "gate" taken shared by every transfer | The gate would put one shared cache line on the path of every transfer, taxing the hot path to speed up a rare audit. Cost accepted: a snapshot stalls transfers and is O(accounts). ThreadSanitizer's own deadlock detector cannot follow more than 64 held locks, so it is switched off (race detection stays on) for the scenarios with more than 60 accounts. |
 | D13 | Account count without a lock | C11 atomic, slot initialised before count is raised | Taking `create_lock` in every transfer | Keeps account creation off the transfer path. `<stdatomic.h>` is part of the C11 compiler, no extra dependency. |
@@ -481,6 +550,8 @@ Found while breaking it:
 | D20 | Reads and durability | `lg_balance`, snapshots and `DUPLICATE` wait for the log to be durable up to the moment they looked | Returning in-memory state immediately | Otherwise a caller could see a balance, the machine could crash, and the money would be gone again: an observable lie even though no `OK` was lost. Cost: a read may wait for one disk flush. |
 | D21 | Checksum | CRC-32 (zlib) | CRC-32C, a cryptographic hash | Detects torn and garbled records, which is the job. Being the zlib polynomial lets Python's `zlib.crc32` verify the C code independently. Not a defence against deliberate tampering. |
 | D22 | No snapshots / log compaction | Out of scope | Periodic checkpoint + log truncation | Recovery time and file size grow with history. A checkpoint needs its own atomic-replace protocol and tests; left out to keep M0-M4 solid. Listed as a limitation. |
+| D23 | One process per log | `flock` on the log file, second opener refused | Trusting the operator | Two writers would interleave records and each would hold a stale in-memory state. The kernel releases the lock on any death, kill -9 included. |
+| D24 | M5 choice | Property test with shrinking (hypothesis, optional) | TLA+ spec | Cheaper, runs against the real code, and reuses the model. A TLA+ spec of group commit + recovery would be the natural next step. |
 
 ## What Landi must understand
 
@@ -551,8 +622,8 @@ Found while breaking it:
 - A test that cannot fail is worthless, so there are negative
   controls: `NAIVE` mode really deadlocks and the watchdog reports it;
   removing any single lock makes the stress test fail.
-- Be ready to say where the design loses: single-threaded (0.68x) and
-  with two hot accounts (0.43x at 8 threads). And that scaling was
+- Be ready to say where the design loses: single-threaded (0.85x) and
+  with two hot accounts (0.46x at 8 threads). And that scaling was
   limited by memory page faults, found by measuring, not guessing.
 - Interview questions: "Why can't this deadlock?" "What if a transfer
   needed three accounts?" (same rule: sort all of them.) "Why is the
@@ -592,3 +663,38 @@ Found while breaking it:
   "What does your crash test not prove?" (real power loss, lying
   disks, mid-log bit rot; see "What is not verified".) "Why refuse a
   record with a valid checksum?"
+
+### M4 - packaging and evidence
+
+- Key decision: the headline number comes from one command
+  (`make demo`) and every claim in the README names the command that
+  produced it. No number is quoted that was not printed by a run.
+- Read the demo output precisely: "transfers committed" counts records
+  that survived in the logs after recovery; "calls that returned"
+  counts acknowledgements the dead processes managed to record. About
+  half of the calls are `DUPLICATE` because every id is deliberately
+  submitted twice.
+- Why 60,000 transfers/s with fsync but 7,400/s single-threaded: the
+  disk does ~6,000 flushes per second either way; group commit puts
+  many transfers into each flush. Throughput = flushes/s x batch size.
+- Be exact about what `kill -9` proves. It proves the code path
+  "acknowledge only after write+fdatasync returned, recover from any
+  prefix". It does not prove the drive kept its promise.
+- Benchmarks are from a shared 4-vCPU cloud VM; a laptop SSD may take
+  1-5 ms per `fdatasync` instead of 0.17 ms, and durable throughput
+  scales down with it. Say that before being asked.
+- Interview questions: "How would you make it faster?" (pre-allocate
+  the idempotency table; batch `write()` in process mode; several
+  log files or a dedicated log thread.) "How would you bound recovery
+  time?" (periodic checkpoint: write a snapshot to a new file, fsync,
+  atomic rename, then start a new log.) "What would you need for two
+  machines?" (replicating the log: a different, much larger project.)
+
+### M5 - property test
+
+- hypothesis generates operation lists and, on failure, shrinks them
+  to a minimal list. Same oracle as M1: the Python model.
+- The lesson worth telling: the first strategy could not find a
+  planted bug, because random inputs rarely reached a successful
+  transfer. Random testing is only as good as the states it reaches;
+  measure that (here: count applied transfers per example).

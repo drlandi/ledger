@@ -258,6 +258,11 @@ def main():
           % stats["bytes_cut_by_recovery"])
     print("  I1-I6 held after every recovery     : yes (%d of %d)"
           % (stats["kills"], stats["kills"]))
+    print("RESULT: %s transfers committed by %d threads across %d "
+          "kill -9 crashes;\n        after every one of the %d "
+          "recoveries all six invariants held."
+          % (format(transfers, ","), args.threads, stats["kills"],
+             stats["kills"]))
 
 
 if __name__ == "__main__":

@@ -51,7 +51,7 @@ MUTANTS = [
     ("negative initial balance accepted", "account.c",
      "initial < 0 ||", ""),
     ("seeded overflow unchecked", "account.c",
-     "l->seeded > INT64_MAX - initial", "0"),
+     "l->seeded > INT64_MAX - (int64_t)c->from", "0"),
     ("account table overrun by one", "account.c",
      "n >= l->cfg.max_accounts", "n > l->cfg.max_accounts"),
 ]
@@ -77,9 +77,9 @@ RACE_MUTANTS = [
      [("lg_lock_all(l, s->count);", ";"),
       ("lg_unlock_all(l, s->count);", ";")]),
     ("account published before it is initialised", "account.c",
-     [("l->acc[n].balance = initial;",
+     [("l->acc[n].balance = (int64_t)c->from;",
        "atomic_store(&l->count, n + 1); sched_yield(); sched_yield();"
-       " l->acc[n].balance = initial;")]),
+       " l->acc[n].balance = (int64_t)c->from;")]),
 ]
 
 
@@ -186,6 +186,14 @@ def main():
         ("recovery", RECOVERY_MUTANTS, ["ledger"], "test_recovery.py",
          lambda e: {"LEDGER": e[0]}),
     ]
+    # Fail fast if the core changed and a pattern no longer applies.
+    for group, mutants, tools, test, env in groups:
+        for name, fname, pairs in mutants:
+            text = open(os.path.join(ROOT, "src", fname)).read()
+            for old, new in pairs:
+                if text.count(old) != 1:
+                    sys.exit("mutant '%s': pattern not found exactly "
+                             "once in %s: %s" % (name, fname, old))
     survivors = []
     total = 0
     for group, mutants, tools, test, env in groups:

@@ -60,7 +60,7 @@ def durable():
     print("\nWith the write-ahead log (per-account locks, uniform "
           "traffic, 64 accounts). Each\ntransfer returns only after "
           "its record is written (process) or written and\nfdatasync'ed "
-          "(full). %d transfers per run, median of 3.\n" % (OPS // 5))
+          "(full). %d transfers per run, median of 3.\n" % (OPS // 25))
     print("| threads | sync=process | sync=full | transfers per "
           "fdatasync |")
     print("|---:|---:|---:|---:|")
@@ -74,7 +74,7 @@ def durable():
                     n += 1
                     out = subprocess.run(
                         [STRESS, "--threads", str(threads), "--ops",
-                         str(OPS // 5 // threads), "--accounts", "64",
+                         str(OPS // 25 // threads), "--accounts", "64",
                          "--hot-pct", "0", "--seed", str(rep + 1),
                          "--wal", os.path.join(d, "wal%d" % n),
                          "--sync", sync],
@@ -90,7 +90,7 @@ def durable():
             print("| %d | %s | %s | %.1f |"
                   % (threads, format(int(cells[0][0]), ","),
                      format(int(cells[1][0]), ","),
-                     OPS // 5 / max(1, cells[1][1])), flush=True)
+                     OPS // 25 / max(1, cells[1][1])), flush=True)
 
 
 if __name__ == "__main__":

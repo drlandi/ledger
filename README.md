@@ -11,7 +11,7 @@ no UI, no dependencies beyond libc and pthreads.
 
 ```
 make test     # everything, about 2 minutes
-make demo     # the headline result, about 3 minutes
+make demo     # the headline result, about 2.5 minutes (DEMO_KILLS=40 for 20 s)
 ```
 
 ## The headline result
@@ -19,7 +19,15 @@ make demo     # the headline result, about 3 minutes
 `make demo` on the machine described under "Benchmarks":
 
 ```
-DEMO_OUTPUT
+Running 400 rounds of: 64 threads transfer money, kill -9, damage the log tail, recover, check.
+crash harness: 400 kill -9, sync=full, 64 threads, 146 s
+  transfers that survived in the logs : 2350072
+  transfer calls that returned        : 4664377 (OK=2344812, DUPLICATE=2204102, INSUFFICIENT_FUNDS=62698, INVALID=52765)
+  tail damage injected                : append=51, flip=49, none=159, truncate=52, truncate+append=38, truncate_to_floor=51
+  bytes of torn tail cut by recovery  : 67575
+  I1-I6 held after every recovery     : yes (400 of 400)
+RESULT: 2,350,072 transfers committed by 64 threads across 400 kill -9 crashes;
+        after every one of the 400 recoveries all six invariants held.
 ```
 
 What one "kill" means: 64 threads submit random transfers (every id
@@ -90,28 +98,73 @@ per invariant (`tests/test_invariants.py`).
 | `make crash-long` | 1000 kills | I1-I6 across crashes |
 | `make mutants` | plants 41 bugs in a copy of the core, one at a time; each must make a test fail | are the tests able to fail? |
 | `make norm` | norminette on the core | 42 Norm |
+| `make test-property` | optional, needs `hypothesis`: same property as test-diff, with shrinking of failing cases | rules |
 
 Results of these on the reference machine are quoted in `DESIGN.md`
 (sections 4-6) and summarised here:
 
 ```
-EVIDENCE
+make test-model     26 tests OK
+make test-diff      3000 seeds, 548,000 operations identical; 1000 seeds under ASan/UBSan identical
+make test-stress    7 scenarios x 3 builds (plain, TSan, ASan) OK; watchdog fires on the planted deadlock
+make test-recovery  11 tests OK (371 cut points, 1,086 corrupted bytes), also under ASan/UBSan
+make test-crash     180 kills in 4 configurations + disk-full + lock + TSan + strace: OK
+make crash-long     1000 kills, 1,269,501 transfers committed, I1-I6 held 1000 of 1000
+make demo           400 kills, 2,350,072 transfers committed, I1-I6 held 400 of 400
+make mutants        41/41 planted bugs caught
+make norm           OK (only the 42 file header is not stamped)
 ```
 
 ## Benchmarks
 
-Machine: BENCH_MACHINE. Reproduce with `make bench` (about 3 minutes).
+Machine: cloud VM, 4 vCPU Intel Xeon @ 2.30 GHz, 15 GB RAM, virtio disk with ext4
+(`fdatasync` of a small append takes about 0.17 ms), Linux 6.18, gcc 13.3 `-O2`. Reproduce with `make bench` (about 3 minutes).
 Throughput on your disk will differ, mostly through the cost of
 `fdatasync`.
 
-BENCH_TABLES
+Durable throughput (write-ahead log on, per-account locks, 64 accounts,
+40,000 transfers per run, median of 3, transfers per second):
+
+| threads | sync=process | sync=full | transfers per fdatasync |
+|---:|---:|---:|---:|
+| 1 | 1,576,703 | 7,447 | 1.0 |
+| 4 | 133,976 | 12,786 | 2.4 |
+| 16 | 187,344 | 27,122 | 8.4 |
+| 64 | 166,353 | 49,223 | 27.5 |
+| 256 | 171,357 | 60,704 | 46.8 |
+
+In-memory core, no log (1,000,000 transfers per run, median of 5):
+
+Uniform traffic over 1024 accounts:
+
+| threads | global lock | per-account locks | ratio |
+|---:|---:|---:|---:|
+| 1 | 3,578,089 | 3,033,960 | 0.85x |
+| 2 | 1,095,747 | 2,825,295 | 2.58x |
+| 4 | 1,151,296 | 4,502,880 | 3.91x |
+| 8 | 1,225,545 | 4,115,066 | 3.36x |
+
+80% of traffic on 2 hot accounts:
+
+| threads | global lock | per-account locks | ratio |
+|---:|---:|---:|---:|
+| 1 | 3,472,291 | 3,255,081 | 0.94x |
+| 2 | 974,608 | 1,386,881 | 1.42x |
+| 4 | 1,374,951 | 667,905 | 0.49x |
+| 8 | 1,208,245 | 559,679 | 0.46x |
 
 Reading the numbers:
 
 - With the log on and `sync=full`, throughput is set by the disk:
-  each batch costs one `fdatasync`, and throughput rises with the
-  number of client threads because more transfers share each flush.
-- In memory, per-account locks are about 3x faster than one global
+  each batch costs one `fdatasync`. One thread gets one transfer per
+  flush (7,447/s); 256 threads share each flush among ~47 transfers
+  (60,704/s). That is group commit doing its job.
+- `sync=process` is fastest with a single thread (1.58M/s) and drops
+  to ~170,000/s with several: every waiting thread issues its own
+  small `write()` and threads hand the log lock back and forth. It was
+  measured, not tuned; the durable mode is the one this project is
+  about.
+- In memory, per-account locks are 2.6x to 3.9x faster than one global
   lock for spread-out traffic with several threads, slower for a
   single thread (three locks instead of one), and slower when nearly
   all traffic hits two accounts. `DESIGN.md` section 5 explains each

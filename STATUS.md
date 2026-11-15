@@ -21,16 +21,29 @@ transfer ledger in C, correctness shown by tests. Design: `DESIGN.md`.
   count, TSan), `make crash-long` (1000 kills: passed, 1.13M transfers).
   CLI `build/ledger` exists (create/transfer/balance/verify/dump).
 
+- M4 packaging: `make demo` (400 kills, 2,350,072 transfers, all
+  invariants held), `make bench`, README with numbers and commands.
+- M5 (stretch): optional hypothesis test with shrinking,
+  `make test-property`. No TLA+ spec.
+
 ## Next
 
-- M4 CLI, demo, benchmarks, README.
+Nothing is required. Natural extensions, in order of value:
+checkpoint + log compaction; pre-allocated idempotency table; TLA+
+model of group commit and recovery; a real power-loss test in a VM.
 
-## Known issues
+## Known issues / limits
 
-- In-memory throughput stops scaling at ~4M transfers/s because of
-  page faults on idempotency-table memory, not locks (DESIGN 5).
-- Per-account locks are slower than the global lock when traffic sits
-  on two hot accounts (measured, documented).
+- Real power loss is simulated (kill -9 + tail damage), not tested.
+- Log, recovery time and idempotency memory grow without bound.
+- Mid-log corruption is detected, not repaired.
+- In-memory throughput is capped near 4.5M/s by page faults on
+  idempotency-table memory; per-account locks lose to the global lock
+  on two hot accounts and single-threaded (DESIGN 5).
+- `sync=process` slows down with many threads (DESIGN 7).
+- 42 file headers are not stamped (needs the author's login).
+- `tests/mutants.py` patterns are tied to the source text; the script
+  checks them up front and names the stale one after a refactor.
 
 ## Conventions
 

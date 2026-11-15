@@ -83,12 +83,25 @@ test-recovery: $(B)/ledger $(B)/ledger_asan
 test-crash: all
 	$(UT) 'test_crash.py'
 
+# The headline result: about two million durable transfers, 400 kills.
+# DEMO_KILLS=40 make demo gives a 20-second version.
+DEMO_KILLS ?= 400
+demo: all
+	@echo "Running $(DEMO_KILLS) rounds of: 64 threads transfer money," \
+		"kill -9, damage the log tail, recover, check."
+	@$(PY) tests/crash_harness.py --iterations $(DEMO_KILLS) --threads 64 \
+		--min-ms 150 --max-ms 450 --epoch 10 --seed 7
+
 # The long version of the crash test: 1000 kills.
 crash-long: all
 	$(PY) tests/crash_harness.py --iterations 1000 --threads 64
 
 bench: $(B)/stress
 	$(PY) tests/bench.py
+
+# Optional (needs `pip install hypothesis`): shrinks failing cases.
+test-property: $(B)/driver
+	$(UT) 'test_property.py'
 
 mutants: all
 	$(PY) tests/mutants.py
@@ -105,4 +118,4 @@ test: test-model test-diff test-stress test-recovery test-crash
 clean:
 	rm -rf $(B) tests/__pycache__
 
-.PHONY: all test test-model test-diff test-stress test-recovery test-crash crash-long bench mutants norm clean
+.PHONY: all test test-model test-diff test-stress test-recovery test-crash crash-long demo bench test-property mutants norm clean
