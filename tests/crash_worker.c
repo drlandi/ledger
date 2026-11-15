@@ -120,6 +120,7 @@ int	main(int argc, char **argv)
 {
 	t_lg_config	cfg;
 	pthread_t	th[256];
+	t_lg_stats	st;
 	uint64_t	id;
 	t_lg_rc		rc;
 	int			threads;
@@ -161,6 +162,10 @@ int	main(int argc, char **argv)
 		pthread_create(&th[t], NULL, worker, (void *)(uintptr_t)t);
 	for (t = 0; t < threads; t++)
 		pthread_join(th[t], NULL);
+	/* Only reached with OPS > 0: report how many write batches the
+	 * log made, so a test can compare that with the system calls. */
+	lg_stats(g_l, &st);
+	printf("flushes=%" PRIu64 "\n", st.flushes);
 	lg_close(g_l);
 	return (0);
 }

@@ -137,8 +137,13 @@ class DiskTrouble(unittest.TestCase):
     def test_fdatasync_is_really_called(self):
         """kill -9 cannot tell whether fdatasync happens: the page
         cache survives the process either way. So count the system
-        calls. FULL: one fdatasync per write batch. PROCESS: none."""
+        calls and compare them with the number of write batches the
+        ledger itself reports. FULL: exactly one fdatasync per batch.
+        PROCESS: batches, but no fdatasync. How many batches there are
+        depends on the machine (a faster disk means smaller batches),
+        so no absolute number is expected."""
         counts = {}
+        batches = {}
         for sync in ("full", "process"):
             wal = os.path.join(self.tmp, "wal." + sync)
             res = subprocess.run(
@@ -146,9 +151,18 @@ class DiskTrouble(unittest.TestCase):
                  WORKER, wal, self.tmp, "8", "24", "0", "9", sync, "500"],
                 capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, res.stderr[-500:])
-            m = re.search(r"(\d+)\s+(?:\d+\s+)?fdatasync", res.stderr)
-            counts[sync] = int(m.group(1)) if m else 0
-        self.assertGreater(counts["full"], 100)
+            # strace -c line: % time, seconds, usecs/call, calls,
+            # [errors], syscall. The call count is the fourth column.
+            counts[sync] = 0
+            for line in res.stderr.split("\n"):
+                cols = line.split()
+                if len(cols) >= 5 and cols[-1] == "fdatasync":
+                    counts[sync] = int(cols[3])
+            batches[sync] = int(re.search(r"flushes=(\d+)",
+                                          res.stdout).group(1))
+        self.assertGreater(batches["full"], 0)
+        self.assertGreater(batches["process"], 0)
+        self.assertEqual(counts["full"], batches["full"])
         self.assertEqual(counts["process"], 0)
 
 

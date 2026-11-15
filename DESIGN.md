@@ -383,8 +383,15 @@ build whose commit buffer holds only 3 records), plus:
   `ERROR`, then `ERROR` for every further call; after restart every
   acknowledged transfer is present
 - the log path under ThreadSanitizer: no race reported
-- `strace` counts system calls: > 100 `fdatasync` in FULL mode, zero
-  in PROCESS mode (skipped if strace is not installed)
+- `strace` counts system calls: in FULL mode exactly one `fdatasync`
+  per write batch the ledger reports, in PROCESS mode batches but no
+  `fdatasync` (skipped if strace is not installed). An earlier version
+  demanded "more than 100" and failed on a second machine with 85-90.
+  It was worse than brittle: its regular expression read the wrong
+  column of `strace -c` (microseconds per call, not the number of
+  calls), so it was really asserting that the disk is slow. It passed
+  here only because `fdatasync` takes ~170 us on this VM. The test now
+  reads the call count and compares it with the batch count.
 
 One harness iteration: start the workload on the ledger left by the
 previous victim; `SIGKILL` it after a random delay (one kill in five
