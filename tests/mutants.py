@@ -1,6 +1,6 @@
-"""Mutation check: is the differential test able to notice a broken
-core? Each mutant is a one-line bug planted in a copy of src/. A
-mutant is "killed" when test_diff fails against it. Survivors mean
+"""Mutation check: are the tests able to notice a broken core? Each
+mutant is a small bug planted in a copy of src/. A mutant is "killed"
+when the test that should notice it fails. Survivors mean
 the tests are blind to that bug.
 
 Usage: python3 tests/mutants.py
@@ -13,9 +13,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MUT = os.path.join(ROOT, "build", "mut")
-CC = ["cc", "-std=c11", "-O1", "-w", "-pthread",
-      "-fsanitize=address,undefined", "-fno-sanitize-recover=all",
+CC = ["cc", "-std=c11", "-w", "-pthread",
       "-I" + os.path.join(ROOT, "include")]
+SAN = ["-O1", "-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 
 MUTANTS = [
     ("off-by-one in funds check", "transfer.c",
@@ -53,44 +53,85 @@ MUTANTS = [
     ("seeded overflow unchecked", "account.c",
      "l->seeded > INT64_MAX - initial", "0"),
     ("account table overrun by one", "account.c",
-     "count >= l->cfg.max_accounts", "count > l->cfg.max_accounts"),
+     "n >= l->cfg.max_accounts", "n > l->cfg.max_accounts"),
 ]
 
 
-def build(name, fname, old, new):
+LOCK = "pthread_mutex_lock(&l->acc[%s].lock);"
+UNLOCK = "pthread_mutex_unlock(&l->acc[%s].lock);"
+
+# Concurrency bugs: judged by the stress test, not the differential one.
+RACE_MUTANTS = [
+    ("account locks removed", "lock.c",
+     [(LOCK % "a", ";"), (LOCK % "b", ";"),
+      (UNLOCK % "a", ";"), (UNLOCK % "b", ";")]),
+    ("only the lower account locked", "lock.c",
+     [(LOCK % "b", ";"), (UNLOCK % "b", ";")]),
+    ("idempotency shard lock removed", "lock.c",
+     [("pthread_mutex_lock(&lg_shard(l, id)->lock);", ";"),
+      ("pthread_mutex_unlock(&lg_shard(l, id)->lock);", ";")]),
+    ("global mode takes no lock", "lock.c",
+     [("pthread_mutex_lock(&l->global_lock);", ";"),
+      ("pthread_mutex_unlock(&l->global_lock);", ";")]),
+    ("snapshot takes no account locks", "snapshot.c",
+     [("lg_lock_all(l, s->count);", ";"),
+      ("lg_unlock_all(l, s->count);", ";")]),
+    ("account published before it is initialised", "account.c",
+     [("l->acc[n].balance = initial;",
+       "atomic_store(&l->count, n + 1); sched_yield(); sched_yield();"
+       " l->acc[n].balance = initial;")]),
+]
+
+
+def build(tool, name, fname, pairs):
     shutil.rmtree(MUT, ignore_errors=True)
     shutil.copytree(os.path.join(ROOT, "src"), MUT)
     path = os.path.join(MUT, fname)
     text = open(path).read()
-    if text.count(old) != 1:
-        sys.exit("mutant '%s': pattern not found exactly once" % name)
-    open(path, "w").write(text.replace(old, new))
+    for old, new in pairs:
+        if text.count(old) != 1:
+            sys.exit("mutant '%s': pattern not found exactly once: %s"
+                     % (name, old))
+        text = text.replace(old, new)
+    open(path, "w").write(text)
     srcs = [os.path.join(MUT, f) for f in os.listdir(MUT)
             if f.endswith(".c")]
-    exe = os.path.join(MUT, "driver")
-    subprocess.run(CC + ["-I" + MUT, "-o", exe,
-                         os.path.join(ROOT, "tests", "driver.c")] + srcs,
-                   check=True)
+    exe = os.path.join(MUT, tool)
+    flags = SAN if tool == "driver" else ["-O2"]
+    subprocess.run(CC + flags + ["-I" + MUT, "-o", exe,
+                                 os.path.join(ROOT, "tests", tool + ".c")]
+                   + srcs, check=True)
     return exe
+
+
+def killed_by(test, env):
+    res = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s",
+         os.path.join(ROOT, "tests"), "-p", test],
+        env=dict(os.environ, **env), capture_output=True, text=True)
+    return res.returncode != 0
 
 
 def main():
     survivors = []
+    total = len(MUTANTS) + len(RACE_MUTANTS)
     for name, fname, old, new in MUTANTS:
-        exe = build(name, fname, old, new)
-        env = dict(os.environ, DRIVER=exe, DIFF_SEEDS="500", DIFF_TIMEOUT="20")
-        res = subprocess.run(
-            [sys.executable, "-m", "unittest", "discover", "-s",
-             os.path.join(ROOT, "tests"), "-p", "test_diff.py"],
-            env=env, capture_output=True, text=True)
-        killed = res.returncode != 0
-        print("%-9s %s" % ("killed" if killed else "SURVIVED", name),
+        exe = build("driver", name, fname, [(old, new)])
+        dead = killed_by("test_diff.py", {"DRIVER": exe, "DIFF_SEEDS": "500",
+                                          "DIFF_TIMEOUT": "20"})
+        print("%-9s %s" % ("killed" if dead else "SURVIVED", name),
               flush=True)
-        if not killed:
+        if not dead:
+            survivors.append(name)
+    for name, fname, pairs in RACE_MUTANTS:
+        exe = build("stress", name, fname, pairs)
+        dead = killed_by("test_stress.py", {"STRESS": exe})
+        print("%-9s %s (race)" % ("killed" if dead else "SURVIVED", name),
+              flush=True)
+        if not dead:
             survivors.append(name)
     shutil.rmtree(MUT, ignore_errors=True)
-    print("%d/%d mutants killed" % (len(MUTANTS) - len(survivors),
-                                    len(MUTANTS)))
+    print("%d/%d mutants killed" % (total - len(survivors), total))
     sys.exit(1 if survivors else 0)
 
 

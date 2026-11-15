@@ -25,6 +25,9 @@ static t_lg_rc	xfer_check(t_ledger *l, const t_lg_xfer *x)
 	return (LG_OK);
 }
 
+/*
+** Caller holds the id's shard lock and both account locks.
+*/
 static t_lg_rc	xfer_apply(t_ledger *l, t_shard *s, const t_lg_xfer *x)
 {
 	t_lg_rc	rc;
@@ -39,14 +42,17 @@ static t_lg_rc	xfer_apply(t_ledger *l, t_shard *s, const t_lg_xfer *x)
 	return (LG_OK);
 }
 
-t_lg_rc	lg_transfer(t_ledger *l, const t_lg_xfer *x)
+/*
+** Caller holds the id's shard lock, so no other thread can look up or
+** insert this id until we return: "check, then apply, then remember"
+** is one atomic step as far as this id is concerned.
+*/
+static t_lg_rc	xfer_locked(t_ledger *l, t_shard *s, const t_lg_xfer *x)
 {
-	t_shard		*s;
 	t_lg_xfer	*old;
+	t_lg_rc		rc;
+	uint64_t	n;
 
-	if (x->amount <= 0 || x->from == x->to)
-		return (LG_INVALID);
-	s = lg_shard(l, x->id);
 	if (lg_idem_reserve(s) != 0)
 		return (LG_ERROR);
 	old = lg_idem_find(s, x->id);
@@ -54,21 +60,23 @@ t_lg_rc	lg_transfer(t_ledger *l, const t_lg_xfer *x)
 		return (LG_DUPLICATE);
 	if (old->amount != 0)
 		return (LG_INVALID);
-	if (x->from >= l->count || x->to >= l->count)
+	n = atomic_load(&l->count);
+	if (x->from >= n || x->to >= n)
 		return (LG_UNKNOWN_ACCOUNT);
-	return (xfer_apply(l, s, x));
+	lg_lock_pair(l, x->from, x->to);
+	rc = xfer_apply(l, s, x);
+	lg_unlock_pair(l, x->from, x->to);
+	return (rc);
 }
 
-/*
-** LG_OK and *out filled if a transfer with this id was applied.
-*/
-t_lg_rc	lg_lookup(t_ledger *l, uint64_t id, t_lg_xfer *out)
+t_lg_rc	lg_transfer(t_ledger *l, const t_lg_xfer *x)
 {
-	t_lg_xfer	*slot;
+	t_lg_rc	rc;
 
-	slot = lg_idem_find(lg_shard(l, id), id);
-	if (slot->amount == 0)
+	if (x->amount <= 0 || x->from == x->to)
 		return (LG_INVALID);
-	*out = *slot;
-	return (LG_OK);
+	lg_lock_id(l, x->id);
+	rc = xfer_locked(l, lg_shard(l, x->id), x);
+	lg_unlock_id(l, x->id);
+	return (rc);
 }

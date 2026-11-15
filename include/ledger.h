@@ -39,9 +39,20 @@ typedef struct s_lg_xfer
 	int64_t		amount;
 }	t_lg_xfer;
 
+/*
+** lock_mode. FINE is the real design: one lock per account, taken in
+** id order. GLOBAL is the baseline: one lock for everything. NAIVE
+** takes the two account locks in from/to order and can deadlock; it
+** exists only so the tests can prove the watchdog notices a deadlock.
+*/
+# define LG_LOCK_FINE 0
+# define LG_LOCK_GLOBAL 1
+# define LG_LOCK_NAIVE 2
+
 typedef struct s_lg_config
 {
 	uint64_t	max_accounts;
+	int			lock_mode;
 }	t_lg_config;
 
 /*

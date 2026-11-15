@@ -8,19 +8,10 @@ void	lg_snap_free(t_lg_snap *s)
 	s->flags = NULL;
 }
 
-t_lg_rc	lg_snapshot(t_ledger *l, t_lg_snap *s)
+static void	snap_copy(t_ledger *l, t_lg_snap *s)
 {
 	uint64_t	i;
 
-	s->count = l->count;
-	s->seeded = l->seeded;
-	s->balance = malloc((s->count + 1) * sizeof(int64_t));
-	s->flags = malloc((s->count + 1) * sizeof(uint32_t));
-	if (!s->balance || !s->flags)
-	{
-		lg_snap_free(s);
-		return (LG_ERROR);
-	}
 	i = 0;
 	while (i < s->count)
 	{
@@ -28,6 +19,30 @@ t_lg_rc	lg_snapshot(t_ledger *l, t_lg_snap *s)
 		s->flags[i] = l->acc[i].flags;
 		i++;
 	}
+}
+
+/*
+** Holds create_lock (no account appears, seeded does not move) and
+** every account lock (no transfer is half-way), so the copy shows one
+** instant of the whole ledger.
+*/
+t_lg_rc	lg_snapshot(t_ledger *l, t_lg_snap *s)
+{
+	pthread_mutex_lock(&l->create_lock);
+	s->count = atomic_load(&l->count);
+	s->seeded = l->seeded;
+	s->balance = malloc((s->count + 1) * sizeof(int64_t));
+	s->flags = malloc((s->count + 1) * sizeof(uint32_t));
+	if (!s->balance || !s->flags)
+	{
+		pthread_mutex_unlock(&l->create_lock);
+		lg_snap_free(s);
+		return (LG_ERROR);
+	}
+	lg_lock_all(l, s->count);
+	snap_copy(l, s);
+	lg_unlock_all(l, s->count);
+	pthread_mutex_unlock(&l->create_lock);
 	return (LG_OK);
 }
 

@@ -122,6 +122,137 @@ Found while breaking it:
 | N1 | No 42 file header | It embeds a student login and e-mail; left for the author to stamp. `make norm` filters only this message. |
 | N2 | One `static const` global (`g_rc_names`) | Read-only name table; the Norm tolerates const globals (norminette emits a notice, not an error). |
 
+## 5. Concurrency (M2)
+
+### Locking strategy
+
+Three kinds of lock, always taken in this order:
+
+```
+create_lock  ->  one idempotency-shard lock  ->  account locks, lowest id first
+```
+
+| Lock | Protects | Held by |
+|---|---|---|
+| `create_lock` | account creation, the seeded total | `lg_create`, `lg_snapshot` |
+| shard lock (1024 of them, chosen by hash of the transfer id) | that shard's part of the idempotency table | `lg_transfer` for its whole duration, `lg_lookup` |
+| account lock (one per account) | that account's balance | `lg_transfer` (both accounts), `lg_balance` (one), `lg_snapshot` (all) |
+
+Why each invariant holds:
+
+- I3 exactly-once. Two submissions of the same id hash to the same
+  shard, so they are serialised by the shard lock. The lock is held
+  from the lookup until the id has been inserted, so the second one
+  must see the first one's entry. "Check then insert" cannot interleave.
+- I1/I4 atomicity. Both account locks are held while the two balances
+  change, so no other thread can see or act on a half-done transfer.
+- I2 no negative balance. The funds check and the debit happen under
+  the source account's lock; the balance cannot change in between.
+- No deadlock. A deadlock is a cycle of threads each waiting for a
+  lock held by the next. Every thread takes locks in the same global
+  order (the line above; account locks by ascending id), and a thread
+  holds at most one shard lock, so a cycle cannot form.
+- Consistent snapshot. `lg_snapshot` holds `create_lock` and *every*
+  account lock (ascending, the same order), so it copies one instant
+  of the whole ledger. Cost: O(accounts) lock operations and it stalls
+  all transfers meanwhile; it is an audit tool, not a hot path.
+
+The account count is a C11 atomic. `lg_create` fills the new slot
+completely and only then raises the count, so a transfer that sees the
+new count sees a finished account. Transfers never take `create_lock`.
+
+`LG_LOCK_GLOBAL` is the baseline: one mutex replaces the shard and
+account locks. `LG_LOCK_NAIVE` takes the two account locks in
+from/to order and is deliberately deadlock-prone; it exists only as a
+negative control for the tests.
+
+### Evidence (M2)
+
+`make test-stress` runs `tests/test_stress.py` three times: plain
+(8 threads x 150,000 operations per scenario), under ThreadSanitizer,
+and under ASan/UBSan. Scenarios: 80% of traffic on 2 hot accounts with
+every id submitted by 3 threads at once plus late replays and
+changed-parameter replays; only 2 accounts; every id submitted by all
+8 threads; accounts being created while transfers run; global-lock
+mode; 4096 accounts. For each run the C tool records every submission
+with its result and a few hundred consistent snapshots taken while the
+workers run; the shared checker then verifies I1 and I2 on every
+snapshot and I1-I4 on the final state, and that no `DUPLICATE` was ever
+answered for a transfer that is not applied.
+
+- Result: all scenarios pass in all three builds; ThreadSanitizer
+  reports no data race.
+- Deadlock watchdog: the tool exits with code 42 if no thread
+  progresses for N seconds. Negative control: in `NAIVE` mode on two
+  accounts the watchdog fires every time
+  (`test_watchdog_catches_a_real_deadlock`), and ThreadSanitizer
+  independently reports "lock-order-inversion" for that mode. The same
+  two detectors stay silent for the real locking mode.
+- `make mutants` now also plants six concurrency bugs (account locks
+  removed, only one account locked, shard lock removed, global mode
+  without its lock, snapshot without locks, account published before
+  it is initialised). The stress test kills 6/6 (24/24 with M1's).
+
+Honest scope: stress testing and TSan show the absence of races on
+the interleavings that happened to occur. They are evidence, not
+proof. The proof-shaped part is the lock-order argument above.
+
+### Throughput: per-account locks vs. global lock
+
+Machine: cloud VM, 4 vCPU Intel Xeon @ 2.30 GHz, in-memory ledger (no
+log yet), 1,000,000 transfers per run, median of 5 runs, transfers per
+second. Reproduce with `make bench`.
+
+Uniform traffic over 1024 accounts:
+
+| threads | global lock | per-account locks | ratio |
+|---:|---:|---:|---:|
+| 1 | 5,740,404 | 3,907,484 | 0.68x |
+| 2 | 1,115,095 | 3,120,250 | 2.80x |
+| 4 | 1,372,247 | 4,136,883 | 3.01x |
+| 8 | 1,517,545 | 4,165,507 | 2.74x |
+
+80% of traffic on 2 hot accounts:
+
+| threads | global lock | per-account locks | ratio |
+|---:|---:|---:|---:|
+| 1 | 4,566,393 | 3,934,083 | 0.86x |
+| 2 | 1,184,354 | 1,216,770 | 1.03x |
+| 4 | 1,296,513 | 659,616 | 0.51x |
+| 8 | 1,323,552 | 565,424 | 0.43x |
+
+What the numbers say, without spin:
+
+1. Single-threaded, the global lock wins (one uncontended mutex
+   instead of three). Fine-grained locking has a fixed price.
+2. With uniform traffic and more than one thread, per-account locks
+   are about 3x faster. The global lock gets *slower* with threads
+   (5.7M -> 1.1M): every transfer bounces the same lock between cores.
+3. With traffic concentrated on two accounts, per-account locks are
+   the *worse* design (0.43x at 8 threads). The hot accounts' locks are
+   a global lock in disguise, and each transfer now pays for three
+   locks and sleeps on a contended one while still holding its shard
+   lock. Fine-grained locking only helps when the workload actually
+   spreads out.
+4. Per-account locking does not scale beyond ~4M/s here, and the cause
+   is not locking. Investigation: the 2-thread run spends 1.15 s in
+   the kernel against 0.18 s single-threaded, with only ~5,000 futex
+   calls per million transfers (`strace -c`) and an identical number
+   of page faults. The time goes to page faults on fresh memory for
+   the idempotency table (every transfer stores 32 bytes), which are
+   much more expensive when several threads fault at once in this VM.
+   One-off experiment (not in the tree): pre-size each shard to 8192
+   slots and touch the memory at open. Result with 4,000,000 transfers:
+   per-account locks 3.5M / 5.3M / 8.5M per second at 1 / 2 / 4
+   threads, global lock 5.8M / 1.5M / 1.9M. So the locking design
+   scales with cores once memory is pre-touched; as shipped, the
+   idempotency table's memory growth is the bottleneck. Pre-allocation
+   was left out to keep the core small (see limitations).
+5. An earlier version of this table was wrong: the benchmark tool
+   itself shared an atomic id counter and a progress counter between
+   threads, and that contention was being measured. The tool now uses
+   per-thread id ranges and per-thread counters in benchmark runs.
+
 ## Decision log
 
 | # | Decision | Chosen | Rejected | Why |
@@ -135,6 +266,10 @@ Found while breaking it:
 | D7 | Codes beyond the brief's five | `FULL` (account table full), `ERROR` (I/O or memory; see M3), `CORRUPT` (log fails validation) | Overloading `INVALID` | These describe the environment, not the request. Mixing them would hide real faults. |
 | D8 | Idempotency table | Sharded open-addressing hash table, grows by doubling, never forgets | Sorted array; one big table; expiring keys | O(1) lookups, and the shards give M2 a natural lock unit. Never forgetting keys means memory grows with history (32 bytes per transfer); a real system would expire keys by age. Listed as a limitation. |
 | D9 | How to test the tests | Mutation check (`make mutants`) | Trusting coverage numbers | A test that cannot fail proves nothing. Planting known bugs and requiring a failure measures exactly that. |
+| D10 | Locking | Shard lock for the id, then per-account locks in ascending id order | (a) One global lock: simplest and fastest single-threaded, but measured 3x slower with uniform multi-threaded traffic. (b) Lock-free CAS on balances: cannot update two balances atomically without a transaction scheme. (c) try-lock and back off: livelock risk and harder to reason about than a fixed order. | Deadlock freedom follows from a one-line ordering rule that can be explained and checked. Measured trade-offs are in section 5, including the workload where this choice loses. |
+| D11 | Hold the shard lock for the whole transfer | Yes | Reserve the id, release, apply, then confirm | A reservation needs an "in progress" state and a way for a concurrent duplicate to wait for it. Holding the lock is correct by construction; with 1024 shards the extra contention is small. |
+| D12 | Consistent snapshot | Lock every account in order | A reader-writer "gate" taken shared by every transfer | The gate would put one shared cache line on the path of every transfer, taxing the hot path to speed up a rare audit. Cost accepted: a snapshot stalls transfers and is O(accounts). ThreadSanitizer's own deadlock detector cannot follow more than 64 held locks, so it is switched off (race detection stays on) for the scenarios with more than 60 accounts. |
+| D13 | Account count without a lock | C11 atomic, slot initialised before count is raised | Taking `create_lock` in every transfer | Keeps account creation off the transfer path. `<stdatomic.h>` is part of the C11 compiler, no extra dependency. |
 
 ## What Landi must understand
 
@@ -185,3 +320,32 @@ Found while breaking it:
   are caught; and tell the story of the mutant that survived because of
   undefined behaviour. Also: "Why is `a + b > MAX` a wrong overflow
   check in C?"
+
+### M2 - concurrency
+
+- Key decision: one lock per account, always taken lowest id first,
+  after the lock of the idempotency shard for the transfer id.
+- Failure it prevents (1): lost updates. Two threads doing
+  `balance = balance - x` on the same account without a lock both read
+  the old value; one debit vanishes and money is created.
+- Failure it prevents (2): deadlock. Thread 1 moves A->B and holds A;
+  thread 2 moves B->A and holds B; each waits for the other forever.
+  Sorting the two ids means both threads ask for A first. One waits,
+  nobody holds B while waiting for A, no cycle.
+- Failure it prevents (3): double apply. Two threads submit the same
+  id at the same moment; both look it up, both find nothing, both
+  apply. The shard lock makes "look up, apply, remember" one step.
+- The four conditions for deadlock (mutual exclusion, hold and wait,
+  no preemption, circular wait): lock ordering removes the fourth.
+- A test that cannot fail is worthless, so there are negative
+  controls: `NAIVE` mode really deadlocks and the watchdog reports it;
+  removing any single lock makes the stress test fail.
+- Be ready to say where the design loses: single-threaded (0.68x) and
+  with two hot accounts (0.43x at 8 threads). And that scaling was
+  limited by memory page faults, found by measuring, not guessing.
+- Interview questions: "Why can't this deadlock?" "What if a transfer
+  needed three accounts?" (same rule: sort all of them.) "Why is the
+  global lock slower with 2 threads than with 1?" (the lock's cache
+  line and the data it protects migrate between cores on every
+  operation.) "What does ThreadSanitizer not prove?" (anything about
+  interleavings that did not occur in the run.)
