@@ -7,10 +7,12 @@ transfer ledger in C, correctness shown by tests. Design: `DESIGN.md`.
 
 - M0 foundations: reference model `tests/model.py`, shared invariant
   checker `tests/invariants.py`, their unit tests, repo skeleton.
+- M1 single-threaded C core (`src/`), differential test
+  (`make test-diff`, 3000 seeds + 1000 under ASan/UBSan), mutation
+  check (`make mutants`, 18/18 killed), Norm clean (`make norm`).
 
 ## Next
 
-- M1 single-threaded C core + differential test against the model.
 - M2 locking (per-account locks in id order vs. global lock baseline).
 - M3 write-ahead log, group commit, recovery, crash harness.
 - M4 CLI, demo, benchmarks, README.

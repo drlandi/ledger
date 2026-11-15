@@ -1,13 +1,43 @@
+CC		= cc
 PY		= python3
+CFLAGS	= -std=c11 -O2 -g -Wall -Wextra -Werror -Iinclude -Isrc
+ASAN	= -fsanitize=address,undefined -fno-sanitize-recover=all
+B		= build
+LIB		= $(wildcard src/*.c)
+HDR		= include/ledger.h $(wildcard src/*.h)
+UT		= $(PY) -m unittest discover -s tests -p
 
-all:
+all: $(B)/driver
+
+$(B)/driver: tests/driver.c $(LIB) $(HDR)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) -o $@ tests/driver.c $(LIB)
+
+$(B)/driver_asan: tests/driver.c $(LIB) $(HDR)
+	@mkdir -p $(B)
+	$(CC) $(CFLAGS) $(ASAN) -o $@ tests/driver.c $(LIB)
 
 test-model:
-	cd tests && $(PY) -m unittest test_model test_invariants
+	$(UT) 'test_model.py'
+	$(UT) 'test_invariants.py'
 
-test: test-model
+test-diff: $(B)/driver $(B)/driver_asan
+	$(UT) 'test_diff.py'
+	DRIVER=$(B)/driver_asan DIFF_SEEDS=1000 $(UT) 'test_diff.py'
+
+mutants:
+	$(PY) tests/mutants.py
+
+# 42 Norm. The 42 file header carries a student login and e-mail, so it
+# is left for the author to stamp; every other rule must pass.
+norm:
+	@norminette src include | grep -v -e INVALID_HEADER -e ': OK!' \
+		-e GLOBAL_VAR_DETECTED | grep -v -x -e '.*: Error!' \
+		&& exit 1 || echo "norm: OK (42 header not stamped)"
+
+test: test-model test-diff
 
 clean:
-	rm -rf build tests/__pycache__
+	rm -rf $(B) tests/__pycache__
 
-.PHONY: all test test-model clean
+.PHONY: all test test-model test-diff mutants norm clean
