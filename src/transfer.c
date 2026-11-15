@@ -1,8 +1,19 @@
 #include "ledger_int.h"
 
-static int	xfer_same(const t_lg_xfer *a, const t_lg_xfer *b)
+/*
+** The id was applied before as old. Same request: DUPLICATE, and the
+** caller must wait until the original is durable before saying so
+** (hence the LSN). Anything else under the same id is an error.
+*/
+static t_lg_rc	xfer_replay(t_ledger *l, const t_lg_xfer *old,
+					const t_lg_xfer *x, uint64_t *lsn)
 {
-	return (a->from == b->from && a->to == b->to && a->amount == b->amount);
+	if (old->from != x->from || old->to != x->to)
+		return (LG_INVALID);
+	if (old->amount != x->amount)
+		return (LG_INVALID);
+	*lsn = lg_tail(l);
+	return (LG_DUPLICATE);
 }
 
 /*
@@ -26,15 +37,21 @@ static t_lg_rc	xfer_check(t_ledger *l, const t_lg_xfer *x)
 }
 
 /*
-** Caller holds the id's shard lock and both account locks.
+** Caller holds the id's shard lock and both account locks. The record
+** goes into the log buffer before the balances change and while the
+** account locks are held: for any one account, log order is therefore
+** the order in which transfers really touched it.
 */
-static t_lg_rc	xfer_apply(t_ledger *l, t_shard *s, const t_lg_xfer *x)
+static t_lg_rc	xfer_apply(t_ledger *l, const t_lg_xfer *x, uint64_t *lsn)
 {
+	t_shard	*s;
 	t_lg_rc	rc;
 
 	rc = xfer_check(l, x);
 	if (rc != LG_OK)
 		return (rc);
+	s = lg_shard(l, x->id);
+	*lsn = lg_log(l, LG_REC_XFER, x);
 	l->acc[x->from].balance -= x->amount;
 	l->acc[x->to].balance += x->amount;
 	*lg_idem_find(s, x->id) = *x;
@@ -47,36 +64,43 @@ static t_lg_rc	xfer_apply(t_ledger *l, t_shard *s, const t_lg_xfer *x)
 ** insert this id until we return: "check, then apply, then remember"
 ** is one atomic step as far as this id is concerned.
 */
-static t_lg_rc	xfer_locked(t_ledger *l, t_shard *s, const t_lg_xfer *x)
+static t_lg_rc	xfer_locked(t_ledger *l, const t_lg_xfer *x, uint64_t *lsn)
 {
 	t_lg_xfer	*old;
 	t_lg_rc		rc;
 	uint64_t	n;
 
-	if (lg_idem_reserve(s) != 0)
+	if (lg_idem_reserve(lg_shard(l, x->id)) != 0)
 		return (LG_ERROR);
-	old = lg_idem_find(s, x->id);
-	if (old->amount != 0 && xfer_same(old, x))
-		return (LG_DUPLICATE);
+	old = lg_idem_find(lg_shard(l, x->id), x->id);
 	if (old->amount != 0)
-		return (LG_INVALID);
+		return (xfer_replay(l, old, x, lsn));
 	n = atomic_load(&l->count);
 	if (x->from >= n || x->to >= n)
 		return (LG_UNKNOWN_ACCOUNT);
 	lg_lock_pair(l, x->from, x->to);
-	rc = xfer_apply(l, s, x);
+	rc = xfer_apply(l, x, lsn);
 	lg_unlock_pair(l, x->from, x->to);
 	return (rc);
 }
 
+/*
+** The locks are released before waiting for the disk (lg_settle), so
+** other transfers can proceed and share the same fdatasync. Nothing
+** is reported to the caller until its record is durable.
+*/
 t_lg_rc	lg_transfer(t_ledger *l, const t_lg_xfer *x)
 {
-	t_lg_rc	rc;
+	t_lg_rc		rc;
+	uint64_t	lsn;
 
 	if (x->amount <= 0 || x->from == x->to)
 		return (LG_INVALID);
+	if (lg_dead(l))
+		return (LG_ERROR);
+	lsn = 0;
 	lg_lock_id(l, x->id);
-	rc = xfer_locked(l, lg_shard(l, x->id), x);
+	rc = xfer_locked(l, x, &lsn);
 	lg_unlock_id(l, x->id);
-	return (rc);
+	return (lg_settle(l, rc, lsn));
 }

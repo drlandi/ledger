@@ -3,7 +3,7 @@ mutant is a small bug planted in a copy of src/. A mutant is "killed"
 when the test that should notice it fails. Survivors mean
 the tests are blind to that bug.
 
-Usage: python3 tests/mutants.py
+Usage: python3 tests/mutants.py [logic|race|crash|recovery]
 """
 
 import os
@@ -13,7 +13,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MUT = os.path.join(ROOT, "build", "mut")
-CC = ["cc", "-std=c11", "-w", "-pthread",
+CC = ["cc", "-std=c11", "-w", "-pthread", "-D_GNU_SOURCE",
       "-I" + os.path.join(ROOT, "include")]
 SAN = ["-O1", "-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
 
@@ -33,11 +33,11 @@ MUTANTS = [
     ("id not remembered", "transfer.c",
      "*lg_idem_find(s, x->id) = *x;", ";"),
     ("replay ignores amount", "transfer.c",
-     "&& a->amount == b->amount", ""),
+     "if (old->amount != x->amount)", "if (0)"),
     ("replay ignores destination", "transfer.c",
-     "a->to == b->to &&", ""),
+     "|| old->to != x->to", ""),
     ("different-params replay treated as duplicate", "transfer.c",
-     "old->amount != 0 && xfer_same(old, x)", "old->amount != 0"),
+     "if (old->from != x->from || old->to != x->to)", "if (0)"),
     ("zero amount accepted", "transfer.c",
      "x->amount <= 0", "x->amount < 0"),
     ("self-transfer accepted", "transfer.c",
@@ -83,7 +83,63 @@ RACE_MUTANTS = [
 ]
 
 
-def build(tool, name, fname, pairs):
+# Durability bugs: judged by the crash tests (test_crash.py).
+CRASH_MUTANTS = [
+    ("OK returned before the record is durable", "wal_util.c",
+     [("if (lg_wal_sync(l->wal, lsn) != 0)", "if (0)")]),
+    ("batch marked durable before it is written", "wal.c",
+     [("target = w->tail;", "target = w->tail; w->durable = target;")]),
+    ("write error ignored", "wal.c",
+     [("if (err != 0)", "if (0)")]),
+    ("fdatasync skipped", "wal.c",
+     [("w->sync_mode == LG_SYNC_FULL && fdatasync(w->fd) != 0", "0")]),
+    ("record logged after the account locks are released", "transfer.c",
+     [("*lsn = lg_log(l, LG_REC_XFER, x);", ";"),
+      ("lg_unlock_pair(l, x->from, x->to);",
+       "lg_unlock_pair(l, x->from, x->to); if (rc == LG_OK) {"
+       " sched_yield(); *lsn = lg_log(l, LG_REC_XFER, x); }")]),
+    ("torn tail not cut off", "wal_open.c",
+     [("ftruncate(w->fd, (off_t)img->end) != 0 || fsync(w->fd) != 0",
+       "0")]),
+    ("two processes may open the same log", "wal_file.c",
+     [("fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) != 0", "0")]),
+    ("log position not restored after recovery", "wal_open.c",
+     [("if (lseek(w->fd, (off_t)img->end, SEEK_SET) < 0)", "if (0)")]),
+    ("DUPLICATE answered before the original is durable", "transfer.c",
+     [("*lsn = lg_tail(l);\n\treturn (LG_DUPLICATE);",
+       "return (LG_DUPLICATE);")]),
+]
+
+# Recovery bugs: judged by the hand-built damaged logs
+# (test_recovery.py).
+RECOVERY_MUTANTS = [
+    ("checksum not verified", "wal_rec.c",
+     [("crc != want ||", "")]),
+    ("checksum does not cover the length field", "wal_rec.c",
+     [("crc = lg_crc32(tab, 0, p, 4);\n\tcrc = lg_crc32(tab, crc, p",
+       "crc = lg_crc32(tab, 0, p, 4);\n\tcrc = lg_crc32(tab, 0, p"),
+      ("crc = lg_crc32(tab, 0, out, 4);\n\tcrc = lg_crc32(tab, crc, out",
+       "crc = lg_crc32(tab, 0, out, 4);\n\tcrc = lg_crc32(tab, 0, out")]),
+    ("record length not bounded by the file", "wal_rec.c",
+     [("if (avail < LG_REC_HDR + len)", "if (0)")]),
+    ("impossible record skipped instead of refused", "recover.c",
+     [("if (replay_one(l, &r) != LG_OK)", "if (0)")]),
+    ("unlimited tail damage accepted", "recover.c",
+     [("if (img->size - img->end > LG_WAL_BUF)", "if (0)")]),
+    ("foreign file overwritten", "recover.c",
+     [("if (hdr < 0)", "if (0)")]),
+    ("torn tail left in place", "wal_open.c",
+     [("else if (img->end < img->size)", "else if (0)")]),
+    ("new account ids not checked on replay", "recover.c",
+     [("if (id != r->x.id)", "if (0)")]),
+]
+
+TOOL_SRC = {"driver": "tests/driver.c", "stress": "tests/stress.c",
+            "crash_worker": "tests/crash_worker.c",
+            "ledger": "cli/ledger_cli.c"}
+
+
+def build(tools, name, fname, pairs):
     shutil.rmtree(MUT, ignore_errors=True)
     shutil.copytree(os.path.join(ROOT, "src"), MUT)
     path = os.path.join(MUT, fname)
@@ -96,12 +152,15 @@ def build(tool, name, fname, pairs):
     open(path, "w").write(text)
     srcs = [os.path.join(MUT, f) for f in os.listdir(MUT)
             if f.endswith(".c")]
-    exe = os.path.join(MUT, tool)
-    flags = SAN if tool == "driver" else ["-O2"]
-    subprocess.run(CC + flags + ["-I" + MUT, "-o", exe,
-                                 os.path.join(ROOT, "tests", tool + ".c")]
-                   + srcs, check=True)
-    return exe
+    exes = []
+    for tool in tools:
+        exe = os.path.join(MUT, tool)
+        flags = SAN if tool == "driver" else ["-O2"]
+        subprocess.run(CC + flags + ["-I" + MUT, "-o", exe,
+                                     os.path.join(ROOT, TOOL_SRC[tool])]
+                       + srcs, check=True)
+        exes.append(exe)
+    return exes
 
 
 def killed_by(test, env):
@@ -113,23 +172,32 @@ def killed_by(test, env):
 
 
 def main():
+    only = sys.argv[1] if len(sys.argv) > 1 else ""
+    groups = [
+        ("logic", [(n, f, [(o, w)]) for n, f, o, w in MUTANTS],
+         ["driver"], "test_diff.py",
+         lambda e: {"DRIVER": e[0], "DIFF_SEEDS": "500",
+                    "DIFF_TIMEOUT": "20"}),
+        ("race", RACE_MUTANTS, ["stress"], "test_stress.py",
+         lambda e: {"STRESS": e[0]}),
+        ("crash", CRASH_MUTANTS, ["crash_worker", "ledger"],
+         "test_crash.py",
+         lambda e: {"CRASH_WORKER": e[0], "LEDGER": e[1]}),
+        ("recovery", RECOVERY_MUTANTS, ["ledger"], "test_recovery.py",
+         lambda e: {"LEDGER": e[0]}),
+    ]
     survivors = []
-    total = len(MUTANTS) + len(RACE_MUTANTS)
-    for name, fname, old, new in MUTANTS:
-        exe = build("driver", name, fname, [(old, new)])
-        dead = killed_by("test_diff.py", {"DRIVER": exe, "DIFF_SEEDS": "500",
-                                          "DIFF_TIMEOUT": "20"})
-        print("%-9s %s" % ("killed" if dead else "SURVIVED", name),
-              flush=True)
-        if not dead:
-            survivors.append(name)
-    for name, fname, pairs in RACE_MUTANTS:
-        exe = build("stress", name, fname, pairs)
-        dead = killed_by("test_stress.py", {"STRESS": exe})
-        print("%-9s %s (race)" % ("killed" if dead else "SURVIVED", name),
-              flush=True)
-        if not dead:
-            survivors.append(name)
+    total = 0
+    for group, mutants, tools, test, env in groups:
+        if only and only != group:
+            continue
+        for name, fname, pairs in mutants:
+            total += 1
+            dead = killed_by(test, env(build(tools, name, fname, pairs)))
+            print("%-9s [%s] %s" % ("killed" if dead else "SURVIVED",
+                                    group, name), flush=True)
+            if not dead:
+                survivors.append(name)
     shutil.rmtree(MUT, ignore_errors=True)
     print("%d/%d mutants killed" % (total - len(survivors), total))
     sys.exit(1 if survivors else 0)

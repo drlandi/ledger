@@ -49,10 +49,25 @@ typedef struct s_lg_xfer
 # define LG_LOCK_GLOBAL 1
 # define LG_LOCK_NAIVE 2
 
+/*
+** sync_mode, used when wal_path is set.
+** FULL: an operation returns only after its log record was written
+** and fdatasync'ed. Survives power loss (as far as the disk is honest).
+** PROCESS: returns after write() without fdatasync. Survives a crash
+** of the process (kill -9), not of the machine.
+*/
+# define LG_SYNC_FULL 0
+# define LG_SYNC_PROCESS 1
+
+/*
+** wal_path NULL: in-memory ledger, nothing survives the process.
+*/
 typedef struct s_lg_config
 {
 	uint64_t	max_accounts;
 	int			lock_mode;
+	int			sync_mode;
+	const char	*wal_path;
 }	t_lg_config;
 
 /*
@@ -66,6 +81,20 @@ typedef struct s_lg_snap
 	uint32_t	*flags;
 }	t_lg_snap;
 
+/*
+** recovered: records replayed at open. truncated: bytes of torn tail
+** cut off at open. tail: log size including buffered records.
+** durable: log size known to be on disk. flushes: write batches.
+*/
+typedef struct s_lg_stats
+{
+	uint64_t	recovered;
+	uint64_t	truncated;
+	uint64_t	tail;
+	uint64_t	durable;
+	uint64_t	flushes;
+}	t_lg_stats;
+
 t_lg_rc		lg_open(const t_lg_config *cfg, t_ledger **out);
 void		lg_close(t_ledger *l);
 t_lg_rc		lg_create(t_ledger *l, int64_t initial, uint32_t flags,
@@ -76,6 +105,8 @@ t_lg_rc		lg_lookup(t_ledger *l, uint64_t id, t_lg_xfer *out);
 t_lg_rc		lg_snapshot(t_ledger *l, t_lg_snap *s);
 void		lg_snap_free(t_lg_snap *s);
 t_lg_rc		lg_verify(t_ledger *l);
+uint64_t	lg_count(t_ledger *l);
+void		lg_stats(t_ledger *l, t_lg_stats *s);
 const char	*lg_rc_name(t_lg_rc rc);
 
 #endif

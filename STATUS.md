@@ -14,10 +14,15 @@ transfer ledger in C, correctness shown by tests. Design: `DESIGN.md`.
   (`src/lock.c`), global-lock baseline, stress tool `tests/stress.c`
   with watchdog, `make test-stress` (plain + TSan + ASan), race
   mutants (24/24 killed), `make bench`. Numbers in DESIGN section 5.
+- M3 durability: WAL with CRC + length framing (`src/wal*.c`), group
+  commit, fail-stop on I/O error, recovery (`src/recover.c`), exclusive
+  file lock. Tests: `make test-recovery` (hand-damaged logs),
+  `make test-crash` (kill -9 harness, disk-full, strace fdatasync
+  count, TSan), `make crash-long` (1000 kills: passed, 1.13M transfers).
+  CLI `build/ledger` exists (create/transfer/balance/verify/dump).
 
 ## Next
 
-- M3 write-ahead log, group commit, recovery, crash harness.
 - M4 CLI, demo, benchmarks, README.
 
 ## Known issues

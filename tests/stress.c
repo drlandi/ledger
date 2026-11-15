@@ -6,6 +6,9 @@
  * to --dup threads at almost the same moment. Some submissions replay
  * an old id, and a few replay one with a changed amount.
  *
+ * --wal FILE [--sync full|process] puts a write-ahead log under the
+ * ledger (FILE must not exist yet).
+ *
  * Benchmark use (--dup 1, no --replay-pct, no --out): ids come from
  * per-thread ranges and progress counters are per-thread, so the tool
  * itself shares no written cache line between threads and the numbers
@@ -21,7 +24,6 @@
  * A watchdog aborts with exit code 42 if no thread makes progress for
  * --watchdog seconds: that is what a deadlock looks like from outside.
  */
-#define _GNU_SOURCE
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -54,6 +56,8 @@ typedef struct s_opt
 	int			watchdog;
 	int			grow;
 	const char	*out;
+	const char	*wal;
+	int			sync;
 }	t_opt;
 
 typedef struct s_worker
@@ -67,7 +71,7 @@ typedef struct s_worker
 }	t_worker;
 
 static t_opt		g_o = {8, 64, 4, 50, 100000, 1, 0, 1, LG_LOCK_FINE,
-	10, 0, NULL};
+	10, 0, NULL, NULL, LG_SYNC_FULL};
 static t_ledger		*g_l;
 static atomic_ullong	g_ctr;
 static t_worker		*g_w;
@@ -274,6 +278,13 @@ static void	parse(int argc, char **argv)
 			g_o.grow = atoi(argv[i + 1]);
 		else if (!strcmp(argv[i], "--out"))
 			g_o.out = argv[i + 1];
+		else if (!strcmp(argv[i], "--wal"))
+			g_o.wal = argv[i + 1];
+		else if (!strcmp(argv[i], "--sync") && !strcmp(argv[i + 1], "full"))
+			g_o.sync = LG_SYNC_FULL;
+		else if (!strcmp(argv[i], "--sync")
+			&& !strcmp(argv[i + 1], "process"))
+			g_o.sync = LG_SYNC_PROCESS;
 		else if (!strcmp(argv[i], "--mode") && !strcmp(argv[i + 1], "fine"))
 			g_o.mode = LG_LOCK_FINE;
 		else if (!strcmp(argv[i], "--mode") && !strcmp(argv[i + 1], "global"))
@@ -300,6 +311,8 @@ static void	setup(void)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.max_accounts = g_o.accounts;
 	cfg.lock_mode = g_o.mode;
+	cfg.wal_path = g_o.wal;
+	cfg.sync_mode = g_o.sync;
 	if (lg_open(&cfg, &g_l) != LG_OK)
 		exit(3);
 	first = g_o.accounts;
@@ -315,6 +328,7 @@ static void	setup(void)
 int	main(int argc, char **argv)
 {
 	t_worker	*w;
+	t_lg_stats	st;
 	pthread_t	aud;
 	pthread_t	cre;
 	double		t0;
@@ -353,9 +367,11 @@ int	main(int argc, char **argv)
 		pthread_join(cre, NULL);
 	if (g_out)
 		write_results(w);
+	lg_stats(g_l, &st);
 	printf("threads=%d ops=%" PRIu64 " seconds=%.3f ops_per_sec=%.0f"
-		" verify=%s\n", g_o.threads, g_o.ops * g_o.threads, dt,
-		g_o.ops * g_o.threads / dt, lg_rc_name(lg_verify(g_l)));
+		" verify=%s flushes=%" PRIu64 "\n", g_o.threads,
+		g_o.ops * g_o.threads, dt, g_o.ops * g_o.threads / dt,
+		lg_rc_name(lg_verify(g_l)), st.flushes);
 	for (t = 0; t < g_o.threads; t++)
 		free(w[t].recs);
 	free(w);

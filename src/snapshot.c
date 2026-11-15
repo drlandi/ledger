@@ -28,6 +28,8 @@ static void	snap_copy(t_ledger *l, t_lg_snap *s)
 */
 t_lg_rc	lg_snapshot(t_ledger *l, t_lg_snap *s)
 {
+	uint64_t	lsn;
+
 	pthread_mutex_lock(&l->create_lock);
 	s->count = atomic_load(&l->count);
 	s->seeded = l->seeded;
@@ -41,9 +43,13 @@ t_lg_rc	lg_snapshot(t_ledger *l, t_lg_snap *s)
 	}
 	lg_lock_all(l, s->count);
 	snap_copy(l, s);
+	lsn = lg_tail(l);
 	lg_unlock_all(l, s->count);
 	pthread_mutex_unlock(&l->create_lock);
-	return (LG_OK);
+	if (lg_settle(l, LG_OK, lsn) == LG_OK)
+		return (LG_OK);
+	lg_snap_free(s);
+	return (LG_ERROR);
 }
 
 /*

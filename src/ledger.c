@@ -24,6 +24,7 @@ void	lg_close(t_ledger *l)
 		free(l->shards[i].slots);
 		i++;
 	}
+	lg_wal_free(l->wal);
 	free(l->acc);
 	free(l);
 }
@@ -32,7 +33,7 @@ void	lg_close(t_ledger *l)
 ** Default mutexes: initialising and destroying them cannot fail on
 ** Linux and needs no cleanup, so lg_close only frees memory.
 */
-static void	lg_init_locks(t_ledger *l)
+static t_lg_rc	lg_init_locks(t_ledger *l)
 {
 	uint64_t	i;
 
@@ -50,6 +51,9 @@ static void	lg_init_locks(t_ledger *l)
 		pthread_mutex_init(&l->acc[i].lock, NULL);
 		i++;
 	}
+	if (!l->cfg.wal_path)
+		return (LG_OK);
+	return (lg_recover(l));
 }
 
 static int	lg_alloc(t_ledger *l)
@@ -77,6 +81,7 @@ static int	lg_alloc(t_ledger *l)
 t_lg_rc	lg_open(const t_lg_config *cfg, t_ledger **out)
 {
 	t_ledger	*l;
+	t_lg_rc		rc;
 
 	*out = NULL;
 	if (cfg->max_accounts == 0 || cfg->max_accounts > LG_MAX_ACCOUNTS)
@@ -87,12 +92,14 @@ t_lg_rc	lg_open(const t_lg_config *cfg, t_ledger **out)
 	if (!l)
 		return (LG_ERROR);
 	l->cfg = *cfg;
-	if (lg_alloc(l) != 0)
+	rc = LG_ERROR;
+	if (lg_alloc(l) == 0)
+		rc = lg_init_locks(l);
+	if (rc != LG_OK)
 	{
 		lg_close(l);
-		return (LG_ERROR);
+		return (rc);
 	}
-	lg_init_locks(l);
 	*out = l;
 	return (LG_OK);
 }

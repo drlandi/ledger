@@ -253,6 +253,208 @@ What the numbers say, without spin:
    threads, and that contention was being measured. The tool now uses
    per-thread id ranges and per-thread counters in benchmark runs.
 
+## 6. Durability and recovery (M3)
+
+### The log
+
+The only persistent state is one append-only file, the write-ahead
+log (WAL). Memory is rebuilt from it at open. Nothing in the file is
+ever modified in place; the only non-append operation is cutting off a
+damaged tail at recovery.
+
+```
+file    "LGWAL001"  record  record  record ...
+record  len u32 | crc u32 | type u8 | body              little-endian
+          len   size of type + body (the framing)
+          crc   CRC-32 (zlib polynomial) of the len field + type + body
+          type  1 = create    id u64, initial i64, flags u32        (len 21)
+                2 = transfer  id u64, from u64, to u64, amount i64  (len 33)
+```
+
+One transfer is one record, so a transfer is on disk completely
+(checksum matches) or not at all: atomicity across crashes (I4) is a
+property of the format. The checksum covers the length field, and the
+length is checked against the two legal values and against the bytes
+actually present *before* it is used.
+
+### Write path and group commit
+
+```
+lg_transfer:
+  shard lock, account locks
+    validate
+    append record to the in-memory log buffer   -> LSN (file offset after it)
+    change the two balances, remember the id
+  release all locks
+  wait until the log is durable up to that LSN  -> only now return OK
+```
+
+"Durable up to an LSN" is produced by group commit (`src/wal.c`): the
+first thread that needs durability becomes the leader, takes the whole
+buffer (its record and everyone else's), swaps in an empty one, and
+does one `write` + `fdatasync` with no lock held. Threads arriving
+meanwhile append to the fresh buffer and wait; when the leader
+finishes they are woken and one of them leads the next batch. One disk
+flush is shared by every transfer that arrived during the previous
+one, which is why more client threads give more throughput.
+
+Two rules make this safe:
+
+1. *Nothing is acknowledged before it is durable.* `OK` is returned
+   only after the record's LSN is durable. The same holds for
+   `DUPLICATE` (it claims "already applied", so the original must be
+   durable first), for `lg_balance` and for snapshots (a reader must
+   not see money a crash could take back).
+2. *Log order respects dependency order.* The record is appended while
+   the account locks are still held. For any single account, the order
+   of records in the log is therefore the order in which transfers
+   really touched it. The log reaches the disk as a prefix, so if a
+   transfer survives a crash, every transfer it depended on (the one
+   that funded it) is earlier in the log and survives too. This is
+   what allows the locks to be released *before* the slow disk wait.
+
+### fsync policy
+
+| Mode | Acknowledge after | Survives | Cost |
+|---|---|---|---|
+| `LG_SYNC_FULL` (default) | `write` + `fdatasync` | process crash and power loss, to the extent the drive honours flush requests | one disk flush per batch |
+| `LG_SYNC_PROCESS` | `write` only | process crash (`kill -9`): the data is in the kernel page cache. Not power loss or kernel crash. | no flush |
+
+`fdatasync` rather than `fsync`: it flushes the data and the file
+size, which is everything recovery needs, and skips timestamps.
+When the log file is created its directory is fsync'ed too, otherwise
+the file itself could vanish after a power cut.
+
+I/O errors are fail-stop. If `write` or `fdatasync` fails, the log is
+marked failed, every waiting and every later operation returns
+`ERROR`, and nothing is retried. Retrying `fsync` after a failure is
+unsafe on Linux: the kernel may already have dropped the dirty pages
+and report success the second time. The process must be restarted,
+and recovery decides from the file what really happened.
+
+### Recovery
+
+`lg_open` reads the file and replays records through `lg_create` and
+`lg_transfer` themselves (with logging off). There is no second
+implementation of the rules for recovery to disagree with, and replay
+is a pure function of the file's bytes (I6). Replay stops at the first
+record that is incomplete or fails its checksum. Then:
+
+| What recovery finds | Meaning | Action |
+|---|---|---|
+| File ends exactly after a valid record | clean | continue |
+| Invalid bytes at the end, at most 1 MiB | torn tail: a batch was being written at the crash | cut the file at the last valid record, fsync, continue |
+| More than 1 MiB of invalid bytes | not a torn tail: one batch is at most 1 MiB (`LG_WAL_BUF`) | refuse to open (`CORRUPT`), file untouched |
+| A record with a correct checksum that the rules reject (overdraw, repeated id, wrong account id ...) | this program never wrote that there: corruption or a bug | refuse to open (`CORRUPT`), file untouched |
+| First bytes are not a prefix of the magic | not a ledger | refuse to open, file untouched |
+| At most 8 bytes, and either a prefix of the magic or all zeros | crash while creating the file (nothing was ever acknowledged) | start a new ledger |
+
+The cut is fsync'ed before anything is appended, so discarded bytes
+cannot reappear behind new records.
+
+Every record cut off by recovery was unacknowledged: an acknowledged
+record belongs to a batch whose `fdatasync` returned, and batches are
+written strictly one after another.
+
+### Evidence (M3)
+
+`make test-recovery` (also with the CLI built under ASan/UBSan) uses
+hand-built logs (`tests/test_recovery.py`; the format is implemented a
+second time in Python, `tests/walfmt.py`, with zlib's CRC):
+
+- a log written by Python is read by C and vice versa, byte-identical
+- a 10-record log cut at every one of its 371 byte offsets: recovery
+  yields exactly the records wholly before the cut, the file is cut
+  there, and a second recovery changes nothing
+- every single byte of that log corrupted three ways (1,086 cases):
+  exactly the records before the damaged one survive
+- zeros, random bytes, a partial record appended: ignored and removed
+- more than 1 MiB of damage, eleven kinds of intact-but-impossible
+  record, foreign files: refused, file byte-for-byte untouched
+
+`make test-crash` runs the crash harness (`tests/crash_harness.py`)
+four ways (full sync, process sync, 96 threads on 6 accounts, and a
+build whose commit buffer holds only 3 records), plus:
+
+- disk refuses to grow the log (`RLIMIT_FSIZE`): the worker gets
+  `ERROR`, then `ERROR` for every further call; after restart every
+  acknowledged transfer is present
+- the log path under ThreadSanitizer: no race reported
+- `strace` counts system calls: > 100 `fdatasync` in FULL mode, zero
+  in PROCESS mode (skipped if strace is not installed)
+
+One harness iteration: start the workload on the ledger left by the
+previous victim; `SIGKILL` it after a random delay (one kill in five
+within the first 4 ms, i.e. during recovery or account creation);
+collect the acks the worker wrote after each returned call; damage
+the log tail beyond the highest offset any ack reported as durable
+(truncate at a random byte, truncate to exactly the durable offset,
+flip bytes, append rubbish or zeros); recover three times; hand the
+recovered balances, the log parsed by Python, and every ack since the
+ledger was created to the shared checker. On top of I1-I6 it requires
+that C and the Python reader agree on where the valid log ends and
+that recovery never cuts below a durable offset.
+
+Long run, `python3 tests/crash_harness.py --iterations 1000 --threads 64 --seed 2026`:
+
+```
+crash harness: 1000 kill -9, sync=full, 64 threads, 107 s
+  transfers that survived in the logs : 1129280
+  transfer calls that returned        : 2076123 (OK=1116204, DUPLICATE=891023, INSUFFICIENT_FUNDS=57547, INVALID=11349)
+  tail damage injected                : append=175, flip=113, none=394, truncate=109, truncate+append=103, truncate_to_floor=106
+  bytes of torn tail cut by recovery  : 227162
+  I1-I6 held after every recovery     : yes (1000 of 1000)
+```
+
+`make mutants`: 17 more planted bugs, all killed (41/41 in total).
+Durability: OK returned before durable; batch marked durable before
+it is written; write error ignored; fdatasync skipped; record logged
+after the account locks are released; torn tail not cut; log position
+not restored; DUPLICATE answered before the original is durable;
+two processes allowed on one log.
+Recovery: checksum not verified; checksum not covering the length;
+length not bounded by the file; impossible record skipped; unlimited
+tail damage accepted; foreign file overwritten; torn tail left in
+place; account ids not checked on replay.
+
+Found while breaking it:
+
+- The first 1000-kill run failed at kill 780: "log header damaged".
+  The worker had been killed before it wrote the 8-byte header, and
+  the harness then appended its rubbish at offset 0, i.e. it damaged
+  bytes below the durable floor, which its own rules forbid (a
+  precedence mistake in one condition). Harness bug, fixed. It raised
+  a real question though: what if a crash during creation leaves the
+  header as zeros (file size on disk, data not)? The ledger used to
+  refuse such a file. Nothing can have been acknowledged at that
+  point, so it is now treated as a new ledger; anything else that is
+  not the magic is still refused untouched.
+- Apart from that, no failure of the core was observed in M3. The
+  mutants are the evidence that the tests are able to fail.
+- One planted bug survived at first ("replay ignores a rejected
+  record") in the crash group. It was a bad mutant, not a blind test:
+  a log produced by a correct writer never contains a rejected record,
+  so the crash tests cannot tell. The same bug is killed by the
+  hand-built logs of `test_recovery.py`, where it now lives.
+- "fdatasync skipped" is invisible to any kill -9 test, because the
+  page cache outlives the process. Only the `strace` test catches it.
+
+### What is not verified
+
+- Real power loss. `SIGKILL` plus tail damage is a simulation: it
+  assumes that data covered by a returned `fdatasync` survives and
+  that damage is confined to the unsynced tail. A drive that lies
+  about flushes, or a kernel bug, is outside what these tests can see.
+- Corruption in the middle of the log (bit rot in old records).
+  Recovery treats the first bad record as the end of the log; if at
+  most 1 MiB follows, the valid records after it are cut off silently
+  (recovery reports the number of bytes discarded, nothing more).
+  Checksums detect the damage; nothing here repairs it.
+- A stale but intact record appearing exactly at the tail (old disk
+  contents resurfacing). Records carry no sequence number or link to
+  their predecessor, so such a record would be accepted if the rules
+  allow it.
+
 ## Decision log
 
 | # | Decision | Chosen | Rejected | Why |
@@ -270,6 +472,15 @@ What the numbers say, without spin:
 | D11 | Hold the shard lock for the whole transfer | Yes | Reserve the id, release, apply, then confirm | A reservation needs an "in progress" state and a way for a concurrent duplicate to wait for it. Holding the lock is correct by construction; with 1024 shards the extra contention is small. |
 | D12 | Consistent snapshot | Lock every account in order | A reader-writer "gate" taken shared by every transfer | The gate would put one shared cache line on the path of every transfer, taxing the hot path to speed up a rare audit. Cost accepted: a snapshot stalls transfers and is O(accounts). ThreadSanitizer's own deadlock detector cannot follow more than 64 held locks, so it is switched off (race detection stays on) for the scenarios with more than 60 accounts. |
 | D13 | Account count without a lock | C11 atomic, slot initialised before count is raised | Taking `create_lock` in every transfer | Keeps account creation off the transfer path. `<stdatomic.h>` is part of the C11 compiler, no extra dependency. |
+| D14 | Persistence | Append-only WAL, state rebuilt by replay | Updating a balance file in place; an embedded database | In-place updates need their own crash protocol (which is a WAL again). Append-only makes "what can a crash damage?" answerable: only the tail. |
+| D15 | When to acknowledge | After the record is durable, with group commit | (a) fsync per transfer under the locks: correct, a few thousand transfers/s at most. (b) Acknowledge first, flush in the background: fast, but an acknowledged transfer can vanish, which breaks I5. | Group commit keeps the strict guarantee and shares each disk flush among all waiting threads. |
+| D16 | Locks during the disk wait | Released ("early lock release") | Holding account locks until durable | Holding them would serialise every transfer on a hot account behind a disk flush. Safe because the record is appended under the locks, so log order respects dependencies, and because readers also wait for durability. |
+| D17 | I/O error handling | Fail-stop, never retry | Retry the write or fsync | After a failed fsync Linux may discard the dirty pages and report success on retry. Stopping and recovering from the file is the only state one can vouch for. |
+| D18 | Torn tail vs. corruption | Cut at most one batch (1 MiB) of invalid tail; refuse anything larger, and refuse intact records the rules reject | Always cut at the first bad record; or never cut | "Always cut" can silently delete arbitrarily many good records behind one flipped bit. "Never cut" cannot restart after an ordinary crash. The 1 MiB bound is exactly what one interrupted batch can explain. |
+| D19 | Recovery code path | Replay through the normal `lg_create` / `lg_transfer` | A dedicated fast apply routine | One implementation of the rules. A valid log must replay with `OK` for every record; anything else is treated as corruption. |
+| D20 | Reads and durability | `lg_balance`, snapshots and `DUPLICATE` wait for the log to be durable up to the moment they looked | Returning in-memory state immediately | Otherwise a caller could see a balance, the machine could crash, and the money would be gone again: an observable lie even though no `OK` was lost. Cost: a read may wait for one disk flush. |
+| D21 | Checksum | CRC-32 (zlib) | CRC-32C, a cryptographic hash | Detects torn and garbled records, which is the job. Being the zlib polynomial lets Python's `zlib.crc32` verify the C code independently. Not a defence against deliberate tampering. |
+| D22 | No snapshots / log compaction | Out of scope | Periodic checkpoint + log truncation | Recovery time and file size grow with history. A checkpoint needs its own atomic-replace protocol and tests; left out to keep M0-M4 solid. Listed as a limitation. |
 
 ## What Landi must understand
 
@@ -349,3 +560,35 @@ What the numbers say, without spin:
   line and the data it protects migrate between cores on every
   operation.) "What does ThreadSanitizer not prove?" (anything about
   interleavings that did not occur in the run.)
+
+### M3 - durability
+
+- Key decision: a write-ahead log with group commit. A transfer is
+  acknowledged only after its record is on disk; many threads share
+  one `fdatasync`.
+- Failure it prevents (1): the lost acknowledgement. The client was
+  told `OK`, the power fails, the transfer is gone. Rule: never
+  answer before `fdatasync` returned for that record.
+- Failure it prevents (2): the half transfer. Debit on disk, credit
+  not. One transfer is one checksummed record; a torn record fails
+  its CRC and is cut off, so it is all or nothing.
+- Failure it prevents (3): the orphan. Transfer B spends money that
+  transfer A delivered; after the crash B exists and A does not.
+  Cannot happen: A's record was appended before B's (B needed the
+  account lock A held), and the file survives as a prefix.
+- Know the difference between `write` (data in the kernel's page
+  cache: survives `kill -9`, not a power cut) and `fsync`/`fdatasync`
+  (data on the device). `kill -9` tests alone cannot distinguish the
+  two; that is why there is a `strace` test and why the harness also
+  destroys the unsynced tail.
+- Know "fsyncgate": after a failed fsync, retrying is not safe, so the
+  ledger stops.
+- Recovery = replay through the same code as normal operation, stop at
+  the first bad record, cut the tail (max 1 MiB), fsync the cut.
+- Interview questions: "A client got a timeout, not an answer. What
+  now?" (Retry with the same id: `OK` if the first attempt was lost,
+  `DUPLICATE` if it was applied. That is what the idempotency key is
+  for.) "Why is it safe to release the locks before the fsync?"
+  "What does your crash test not prove?" (real power loss, lying
+  disks, mid-log bit rot; see "What is not verified".) "Why refuse a
+  record with a valid checksum?"
