@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the older run pointless: cancel it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Naming bash makes GitHub add `-o pipefail`, so `make test | tee` below
+    # still fails the step when make fails.
+    shell: bash
+
+jobs:
+  test:
+    name: norm + make test
+    runs-on: ubuntu-24.04
+    # `make test` takes about 8-10 minutes; anything near 25 is a hang.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # cc, make and python3 are already on the runner.
+      # strace: one crash test counts fdatasync calls with it.
+      # norminette: the 42 Norm checker behind `make norm`, version pinned.
+      - name: Install strace and norminette
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends strace
+          pipx install norminette==3.3.60
+
+      # ThreadSanitizer cannot lay out its shadow memory when the kernel
+      # randomizes addresses with more than 28 bits (the default here is 32):
+      # it aborts with "unexpected memory mapping", exit 66. This is a limit
+      # of the tool on this runner image, not a ledger bug.
+      - name: Lower address randomization for ThreadSanitizer
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Check the 42 Norm
+        run: make norm
+
+      - name: Run all tests
+        run: make test 2>&1 | tee test-output.log
+
+      # A failing crash test prints "ledger kept in /tmp/ledger-...": keep
+      # that directory and the full output, so a failure that does not
+      # reproduce can still be diagnosed.
+      - name: Keep the evidence of a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            test-output.log
+            /tmp/ledger-*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # Separate job: the model check is independent of the C code, takes about
+  # as long as the tests, and so runs beside them instead of after them.
+  model:
+    name: TLA+ model
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Downloads tla2tools.jar once, then checks the model with TLC.
+      - name: Check the TLA+ model
+        run: make model 2>&1 | tee model-output.log
+
+      - name: Keep the evidence of a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            model-output.log
+            model/MC_TTrace_*
+          if-no-files-found: ignore
+          retention-days: 14
