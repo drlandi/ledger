@@ -28,7 +28,8 @@ static int	wal_write(t_wal *w, const uint8_t *p, uint64_t n)
 ** Group commit. Caller holds the log lock and becomes the leader: it
 ** takes the whole buffer (its own record and everybody else's), swaps
 ** in the empty spare so others can keep appending, and does one
-** write + fdatasync for the batch with the lock released.
+** write + fdatasync for the batch with the lock released. The batch
+** is closed with its commit record first (lg_wal_seal).
 */
 static void	wal_flush(t_wal *w)
 {
@@ -38,6 +39,7 @@ static void	wal_flush(t_wal *w)
 	int			err;
 
 	w->flushing = 1;
+	lg_wal_seal(w);
 	batch = w->buf;
 	w->buf = w->spare;
 	w->spare = batch;
@@ -71,15 +73,22 @@ static void	wal_step(t_wal *w)
 /*
 ** Copies one record into the buffer and returns its LSN: the file
 ** offset just past it. Nothing touches the disk here. If the buffer
-** is full the caller helps to empty it first.
+** is full (room is always kept for the commit record) the caller
+** helps to empty it first. It does so while still holding its account
+** locks: that is what keeps log order equal to the order in which
+** transfers touched an account. The loop re-checks after every wait,
+** because the buffer it finds afterwards is a different one.
 */
 uint64_t	lg_wal_append(t_wal *w, const uint8_t *rec, size_t n)
 {
 	uint64_t	lsn;
 
 	pthread_mutex_lock(&w->lock);
-	while (w->len + n > LG_WAL_BUF && !atomic_load(&w->failed))
+	while (w->len + n > LG_WAL_BUF - LG_COMMIT && !atomic_load(&w->failed))
+	{
+		w->full_waits++;
 		wal_step(w);
+	}
 	if (!atomic_load(&w->failed))
 	{
 		memcpy(w->buf + w->len, rec, n);

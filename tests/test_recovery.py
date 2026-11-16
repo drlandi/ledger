@@ -66,6 +66,19 @@ SAMPLE = [
     walfmt.create(3, 5),
     walfmt.transfer(15, 3, 1, 5),
 ]
+# Since the commit-record format (DESIGN D25) a log is a sequence of
+# batches. Here every record is a batch of its own, which is what ten
+# separate CLI invocations write.
+FULL = walfmt.log([[r] for r in SAMPLE])
+
+
+def prefix(nrec):
+    return walfmt.log([[r] for r in SAMPLE[:nrec]])
+
+
+def bounds():
+    """File offset where each batch of FULL ends."""
+    return [len(prefix(n)) for n in range(len(SAMPLE) + 1)]
 
 
 class Recovery(unittest.TestCase):
@@ -90,7 +103,7 @@ class Recovery(unittest.TestCase):
         self.write(data)
         first = dump(self.path)
         self.assertIsNotNone(first, note)
-        good = walfmt.MAGIC + b"".join(SAMPLE[:nrec])
+        good = prefix(nrec)
         self.assertEqual(self.read(), good, note)
         m = replay(walfmt.parse(good)[0])
         second = dump(self.path)
@@ -109,11 +122,13 @@ class Recovery(unittest.TestCase):
         self.write(data)
         code, _ = cli(self.path, "verify")
         self.assertEqual(code, 3, note)
+        self.assertIsNotNone(walfmt.verdict(data) if data[:8]
+                             == walfmt.MAGIC and walfmt.parse(data)[1]
+                             != len(data) else "rules", note)
         self.assertEqual(self.read(), data, note + ": file was modified")
 
     def test_log_written_by_python_is_read_by_c(self):
-        self.expect_prefix(walfmt.MAGIC + b"".join(SAMPLE), len(SAMPLE),
-                           "python-written log")
+        self.expect_prefix(FULL, len(SAMPLE), "python-written log")
 
     def test_log_written_by_c_is_read_by_python(self):
         cli(self.path, "create", 0, "overdraft")
@@ -126,37 +141,41 @@ class Recovery(unittest.TestCase):
         self.assertEqual(recs, [(1, 0, 0, 1), (1, 1, 1000, 0),
                                 (2, 10, 0, 1, 500),
                                 (2, 2**64 - 1, 1, 0, 1)])
-        self.assertEqual(data, walfmt.MAGIC + walfmt.create(0, 0, 1)
-                         + walfmt.create(1, 1000)
-                         + walfmt.transfer(10, 0, 1, 500)
-                         + walfmt.transfer(2**64 - 1, 1, 0, 1))
+        self.assertEqual(data, walfmt.log([
+            [walfmt.create(0, 0, 1)], [walfmt.create(1, 1000)],
+            [walfmt.transfer(10, 0, 1, 500)],
+            [walfmt.transfer(2**64 - 1, 1, 0, 1)]]))
 
     def test_torn_at_every_byte(self):
-        full = walfmt.MAGIC + b"".join(SAMPLE)
-        bounds = [len(walfmt.MAGIC)]
-        for rec in SAMPLE:
-            bounds.append(bounds[-1] + len(rec))
+        full = FULL
         for cut in range(len(full) + 1):
-            whole = sum(1 for b in bounds[1:] if b <= cut)
+            whole = sum(1 for b in bounds()[1:] if b <= cut)
             self.expect_prefix(full[:cut], whole, "cut at byte %d" % cut)
 
     def test_every_byte_corrupted(self):
-        """One damaged byte anywhere: recovery keeps exactly the
-        records before the damaged one."""
-        full = walfmt.MAGIC + b"".join(SAMPLE)
-        bounds = [len(walfmt.MAGIC)]
-        for rec in SAMPLE:
-            bounds.append(bounds[-1] + len(rec))
+        """One damaged byte anywhere. In the last batch it may be a
+        torn write: that batch is cut off and everything before it
+        survives. Anywhere else, batches written later sit behind the
+        damage, so the damaged one had been acknowledged: the log is
+        refused and left untouched.
+
+        Until D25 this test demanded "keep exactly the records before
+        the damaged one" for every position, i.e. it demanded the
+        silent loss of the acknowledged records behind the damage."""
+        full = FULL
+        last = bounds()[-2]
         for pos in range(len(walfmt.MAGIC), len(full)):
             for mask in (0x01, 0x80, 0xFF):
                 bad = bytearray(full)
                 bad[pos] ^= mask
-                whole = sum(1 for b in bounds[1:] if b <= pos)
-                self.expect_prefix(bytes(bad), whole,
-                                   "byte %d ^ %#x" % (pos, mask))
+                note = "byte %d ^ %#x" % (pos, mask)
+                if pos >= last:
+                    self.expect_prefix(bytes(bad), len(SAMPLE) - 1, note)
+                else:
+                    self.expect_refused(bytes(bad), note)
 
     def test_rubbish_after_the_last_record(self):
-        full = walfmt.MAGIC + b"".join(SAMPLE)
+        full = FULL
         rng = random.Random(3)
         tails = [b"\0" * n for n in (1, 7, 8, 9, 41, 4096)]
         tails += [bytes(rng.randrange(256) for _ in range(n))
@@ -165,19 +184,17 @@ class Recovery(unittest.TestCase):
         tails.append(walfmt.transfer(99, 1, 2, 10)[:-1])
         tails.append(b"\0" * 2**20)              # exactly the limit
         for i, tail in enumerate(tails):
-            if tail is SAMPLE[3]:
-                continue
             self.expect_prefix(full + tail, len(SAMPLE), "tail %d" % i)
 
     def test_more_damage_than_a_torn_write_can_cause_is_refused(self):
-        full = walfmt.MAGIC + b"".join(SAMPLE)
+        full = FULL
         self.expect_refused(full + b"\0" * (2**20 + 1), "1 MiB + 1 tail")
         bad = bytearray(full + walfmt.transfer(50, 0, 1, 1) * 30000)
         bad[len(full) + 3] ^= 0x10
         self.expect_refused(bytes(bad), "damage with 1.2 MB behind it")
 
     def test_intact_but_impossible_records_are_refused(self):
-        full = walfmt.MAGIC + b"".join(SAMPLE)
+        full = FULL
         cases = {
             "transfer id repeated": SAMPLE[3],
             "overdraw": walfmt.transfer(50, 1, 2, 10**9),
@@ -192,8 +209,16 @@ class Recovery(unittest.TestCase):
             "seeded total overflow": walfmt.create(4, 2**63 - 1),
         }
         for note, rec in cases.items():
-            self.expect_refused(full + rec, note)
-            self.expect_refused(full + rec + SAMPLE[3], note + " + more")
+            # Committed, so recovery must believe it was written; the
+            # same record without its commit record is only a torn
+            # tail and is cut off.
+            bad = walfmt.seal(full, [rec])
+            self.expect_refused(bad, note)
+            self.expect_refused(walfmt.seal(bad, [SAMPLE[3]]),
+                                note + " + more")
+            self.expect_refused(walfmt.seal(full, [SAMPLE[3], rec]),
+                                note + " in a batch of two")
+            self.expect_prefix(full + rec, len(SAMPLE), note + " torn")
 
     def test_wrong_file_is_refused_and_not_touched(self):
         self.expect_refused(b"LGWAL002", "future version")

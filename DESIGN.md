@@ -266,17 +266,23 @@ ever modified in place; the only non-append operation is cutting off a
 damaged tail at recovery.
 
 ```
-file    "LGWAL001"  record  record  record ...
+file    "LGWAL001"  batch  batch  batch ...
+batch   record  record ...  commit-record
 record  len u32 | crc u32 | type u8 | body              little-endian
           len   size of type + body (the framing)
           crc   CRC-32 (zlib polynomial) of the len field + type + body
           type  1 = create    id u64, initial i64, flags u32        (len 21)
                 2 = transfer  id u64, from u64, to u64, amount i64  (len 33)
+                3 = commit    start u64                             (len 9)
+                              start = file offset where this batch began
 ```
 
-One transfer is one record, so a transfer is on disk completely
-(checksum matches) or not at all: atomicity across crashes (I4) is a
-property of the format. The checksum covers the length field, and the
+A batch is what one group-commit flush writes: the records that were
+waiting, closed by one commit record (17 bytes; added in the follow-up
+round, decision D25). Recovery believes a record only if the commit
+record of its batch is there, so a batch is on disk completely or not
+at all, and with it every transfer in it: atomicity across crashes
+(I4) is a property of the format. The checksum covers the length field, and the
 length is checked against the two legal values and against the bytes
 actually present *before* it is used.
 
@@ -297,7 +303,11 @@ first thread that needs durability becomes the leader, takes the whole
 buffer (its record and everyone else's), swaps in an empty one, and
 does one `write` + `fdatasync` with no lock held. Threads arriving
 meanwhile append to the fresh buffer and wait; when the leader
-finishes they are woken and one of them leads the next batch. One disk
+finishes they are woken and one of them leads the next batch. The
+leader closes the batch with its commit record before writing it.
+If the buffer is full, an appender has to get it flushed first, and it
+does so while still holding its account locks (rule 2 below needs the
+record to be in the log before the locks are released). One disk
 flush is shared by every transfer that arrived during the previous
 one, which is why more client threads give more throughput.
 
@@ -306,8 +316,10 @@ Two rules make this safe:
 1. *Nothing is acknowledged before it is durable.* `OK` is returned
    only after the record's LSN is durable. The same holds for
    `DUPLICATE` (it claims "already applied", so the original must be
-   durable first), for `lg_balance` and for snapshots (a reader must
-   not see money a crash could take back).
+   durable first), for `lg_balance`, `lg_lookup` and snapshots (a
+   reader must not see money a crash could take back), and since D26
+   for rejections that were decided by looking at state:
+   `INSUFFICIENT_FUNDS` and `INVALID` for an id used with other values.
 2. *Log order respects dependency order.* The record is appended while
    the account locks are still held. For any single account, the order
    of records in the log is therefore the order in which transfers
@@ -343,21 +355,41 @@ implementation of the rules for recovery to disagree with, and replay
 is a pure function of the file's bytes (I6). Replay stops at the first
 record that is incomplete or fails its checksum. Then:
 
+Recovery first finds the end of the last *complete batch* (records
+followed by a commit record that names the batch's own start). Call
+what follows it the tail.
+
 | What recovery finds | Meaning | Action |
 |---|---|---|
-| File ends exactly after a valid record | clean | continue |
-| Invalid bytes at the end, at most 1 MiB | torn tail: a batch was being written at the crash | cut the file at the last valid record, fsync, continue |
-| More than 1 MiB of invalid bytes | not a torn tail: one batch is at most 1 MiB (`LG_WAL_BUF`) | refuse to open (`CORRUPT`), file untouched |
-| A record with a correct checksum that the rules reject (overdraw, repeated id, wrong account id ...) | this program never wrote that there: corruption or a bug | refuse to open (`CORRUPT`), file untouched |
-| First bytes are not a prefix of the magic | not a ledger | refuse to open, file untouched |
+| File ends exactly after a complete batch | clean | continue |
+| A tail of at most 1 MiB that holds no commit record, or only the commit record of the batch starting there, as the very last bytes of the file | torn tail: the one batch that was being written at the crash. Its blocks may have reached the disk in any order, so intact records and even its commit record may sit behind a hole | cut the file at the last complete batch, fsync, continue |
+| A tail in which a commit record of *another* batch survives, or in which anything follows the batch's own commit record | something was written after the damaged batch. A batch is only written after the previous one was durable and acknowledged, so the damage is in acknowledged data | refuse to open (`CORRUPT`, reason `LG_WHY_BEHIND`), file untouched |
+| A tail of more than 1 MiB | not a torn tail: one batch is at most 1 MiB (`LG_WAL_BUF`) | refuse (`LG_WHY_LONG_TAIL`), file untouched |
+| A committed record that the rules reject (overdraw, repeated id, wrong account id ...) | this program never wrote that there: corruption or a bug | refuse (`LG_WHY_RULES`), file untouched |
+| First bytes are not a prefix of the magic | not a ledger | refuse (`LG_WHY_FOREIGN`), file untouched |
 | At most 8 bytes, and either a prefix of the magic or all zeros | crash while creating the file (nothing was ever acknowledged) | start a new ledger |
 
 The cut is fsync'ed before anything is appended, so discarded bytes
 cannot reappear behind new records.
 
-Every record cut off by recovery was unacknowledged: an acknowledged
-record belongs to a batch whose `fdatasync` returned, and batches are
-written strictly one after another.
+Why cutting is safe when it happens: an acknowledged record belongs to
+a batch whose `fdatasync` returned. If that batch is the last thing in
+the file and it is complete, it is kept. If it is followed by a later
+batch, damage in it is refused, not cut. What is cut is a batch with
+no proof of a later write behind it. The remaining ambiguity is listed
+honestly under "What is not verified" (section 9): an acknowledged
+*last* batch that is damaged looks the same as a torn one.
+
+The CLI prints the reason, for example:
+
+```
+ledger: cannot open my.wal: CORRUPT (damage in front of data that was
+written later: acknowledged transfers would be lost by cutting; file
+left untouched)
+```
+
+Until D25 the rule was "stop at the first bad record; cut if at most
+1 MiB follows". Section 9 shows why that was a defect.
 
 ### Evidence (M3)
 
@@ -452,7 +484,7 @@ Found while breaking it:
 - "fdatasync skipped" is invisible to any kill -9 test, because the
   page cache outlives the process. Only the `strace` test catches it.
 
-### What is not verified
+### What is not verified (as of M3; section 9 has the current list)
 
 - Real power loss. `SIGKILL` plus tail damage is a simulation: it
   assumes that data covered by a returned `fdatasync` survives and
@@ -528,8 +560,308 @@ boundary. The strategy now starts every case with funded accounts and
 uses small amounts. Lesson kept in the file's comments: a generator
 has to be checked against a known bug, exactly like any other test.
 
-No TLA+ model was written; the lock-order and log-order arguments in
-sections 5 and 6 are prose, not machine-checked.
+(At M5 no TLA+ model existed; section 10 adds one.)
+
+## 9. Follow-up round: the three gaps
+
+The first round ended by naming the three places most likely to still
+hide a bug. This round attacked them. Two were hiding one.
+
+### What changed in the core
+
+| Change | Files | Decision |
+|---|---|---|
+| Every batch ends with a commit record | `src/wal.c`, `src/wal_batch.c` (new), `src/wal_rec.c` | D25 |
+| Recovery: find complete batches, cut or refuse the tail, give the reason | `src/recover.c`, `src/wal_batch.c`, `include/ledger.h` (`LG_WHY_*`, `t_lg_config.why`) | D25, D26, D29 |
+| State-dependent rejections wait for durability | `src/transfer.c`, `src/wal_util.c` (`lg_reject`, `lg_settle`) | D27 |
+| `t_lg_stats.full_waits`: how often an appender found the buffer full | `src/wal.c`, `src/lookup.c` | evidence for gap 1 |
+
+No new Norm deviation (`make norm`).
+
+### Gap 1: group commit, the buffer-full path
+
+The path: `lg_wal_append` finds no room, and the caller, still holding
+its two account locks and its id-shard lock, waits for the running
+flush or performs one itself, then re-checks.
+
+No defect was found in it. What is new is that it is now tested on
+purpose instead of by accident:
+
+- `tests/gate.c` (run by `tests/test_groupcommit.py`, plain and under
+  ThreadSanitizer). The linker redirects the ledger's `fdatasync` to a
+  function that blocks until the test releases it. With a 128-byte
+  buffer (two records + commit record) the test builds exactly this:
+  A is in `fdatasync`; B and C fill the buffer; D arrives, finds it
+  full, and waits holding accounts 4 and 5; a reader of account 5, a
+  transfer E that spends what D delivers, and a retry of D queue up
+  behind D. Then the disk is released one batch at a time, and after
+  each release the test asserts exactly who has returned and who must
+  still be waiting. Finally the log must contain the batches `[A]`,
+  `[B C]`, then D before E, each id once.
+- Storms: the same 128-byte build, 32 threads on 3 accounts, run to
+  completion (FULL and PROCESS sync, and under ThreadSanitizer), and
+  64 threads under kill -9 (and 32 under kill -9 with ThreadSanitizer;
+  the harness fails if a killed worker had printed a report). The
+  test asserts the path is the common case, not a rarity
+  (`full_waits` greater than a quarter of all applied transfers) and
+  that no batch ever holds more than two records.
+- 8 mutants (`python3 tests/mutants.py wal`): waiting records dropped;
+  flushing without waiting for the running flush; "if" instead of
+  "while" after the wait; no room kept for the commit record; records
+  that arrived during a flush marked durable; only one waiter woken;
+  batch without commit record; commit record with the wrong start.
+
+### Gap 2: torn tail or corruption
+
+The defect, reproducible on the previous commit (`git checkout 697ecdd
+&& make`):
+
+```
+$ L=build/ledger; $L w create 0 overdraft; $L w create 0
+$ for i in 1 2 3 4; do $L w transfer $i 0 1 100; done    # 4 x OK
+$ $L w balance 1
+OK 400
+$ python3 -c "d=bytearray(open('w','rb').read()); d[127]^=1; open('w','wb').write(d)"
+$ $L w verify
+OK: 2 accounts, 0 cents seeded, 3 log records replayed, 123 torn bytes discarded
+$ $L w balance 1
+OK 100
+```
+
+One flipped bit in the second transfer, and transfers 2, 3 and 4, all
+acknowledged, are gone, with `OK` on the screen. That violates I5. The
+old rule (D18) allowed it knowingly ("if at most 1 MiB follows, the
+valid records after it are cut off silently") and the old test
+`test_every_byte_corrupted` even demanded it.
+
+Why the old format could not do better: a record said nothing about
+when it was written. "Bad bytes, then good records" is what a torn
+batch whose blocks arrived out of order looks like (must be cut), and
+also what a rotten old record looks like (must not be cut). The commit
+record adds the missing fact: where each write began and ended.
+
+The same commands on this commit:
+
+```
+$ $L w verify
+ledger: cannot open w: CORRUPT (damage in front of data that was written
+later: acknowledged transfers would be lost by cutting; file left untouched)
+```
+
+The cases of the brief, each decided from I5 ("could an acknowledged
+transfer be lost by cutting here?"), all in `tests/test_torn.py`:
+
+| Case | Decision | Why |
+|---|---|---|
+| Hole (zeros or rubbish) anywhere in the last batch, later bytes of that batch present, including its commit record | cut the batch | one interrupted write explains it; it was never acknowledged as far as the file can show |
+| Earlier batch missing, zero-filled or damaged; a later batch present | refuse | the later batch proves the earlier one was acknowledged |
+| Damaged last batch whose intact commit record is followed by anything | refuse | whatever follows was written later |
+| Stale intact records after the true end, no commit record | cut | nobody was told they happened |
+| Stale complete batch copied from another offset | refuse | its commit record names a different start |
+| Stale complete batch at the right offset that breaks the rules | refuse | rules check on committed records |
+| Stale complete batch at the right offset that the rules accept | **believed** (known limit, pinned by a test) | nothing in the file distinguishes it |
+| Unreadable tail of 1 MiB - 1, exactly 1 MiB | cut | a batch can be that large |
+| Unreadable tail of 1 MiB + 1 | refuse | no batch is that large |
+| A real, full 1 MiB batch, damaged at its first byte, middle, commit record, first block lost, last block lost | cut | still one batch |
+| The same 1 MiB batch damaged, with one small batch behind it | refuse | later write |
+| Bad checksum on an intact record in the middle of the log | refuse | this is the old defect |
+| The same in the last batch | cut | torn write |
+| 2 to 4 damaged bytes anywhere (400 random cases) | refuse if any commit record from the first damaged batch on survives and that batch is not the last; else cut | see the limit below |
+
+Every expectation is written from the batch layout by hand and is also
+compared with `walfmt.verdict`, a second implementation of the rule in
+Python. The crash harness applies the rule to real kill -9 logs: after
+tearing the tail it asks `walfmt.verdict`; if the damage must be
+refused it checks that the C code refuses and leaves the file
+untouched, then restores the bytes and continues. A new damage kind
+"rot" flips one bit in a batch that has a later batch behind it, and a
+kind "hole" zeroes a block of the unsynced part.
+
+8 mutants (`python3 tests/mutants.py torn`), the first one being the
+old rule itself.
+
+### Gap 3: reads, DUPLICATE and rejections vs. durability
+
+A second defect, smaller, found while writing these tests: a rejection
+could be answered from state that was not durable. Thread A debits an
+account (record still in the buffer); thread B is refused with
+`INSUFFICIENT_FUNDS` at once; crash; A's debit never happened. B holds
+an answer that no state of the recovered ledger explains. The same for
+`INVALID` on an id "already used with other values". Fixed (D27):
+those answers now wait like a read. In `tests/gate.c` this is the
+observer "transfer from the emptied account"; with the fix reverted
+the test fails with
+
+```
+FAIL: batch 1 in fdatasync: 'transfer from the emptied account
+(INSUFFICIENT_FUNDS)' returned INSUFFICIENT_FUNDS before the data it
+depends on was durable
+```
+
+Tests:
+
+- `tests/gate.c`, scenario 1: one transfer sits in `fdatasync`. A
+  balance read, a lookup, a retry (`DUPLICATE`), the id with another
+  amount (`INVALID`), a transfer from the emptied account
+  (`INSUFFICIENT_FUNDS`) and a snapshot are started. None may return
+  while the disk is shut. Scenario 2: a second transfer is in the
+  buffer *behind* the batch in flight; a reader that saw it must still
+  be waiting after the first batch became durable.
+- Crash harness (`tests/crash_harness.py`, function `explain`): the
+  workers now also call `lg_balance`, `lg_lookup` and `lg_snapshot`
+  and record what they were shown, each with the `durable` offset the
+  ledger reported right after the call. After every kill and recovery:
+  an `OK`/`DUPLICATE` must have its record at or before that offset; a
+  balance must be a value the account really had at some point up to
+  that offset, and not older than the caller's own last acknowledged
+  transfer on it; a found lookup must be in the log up to there; a
+  whole snapshot must equal the state after some prefix of the log up
+  to there; an `INSUFFICIENT_FUNDS` must be explainable by a moment up
+  to there at which the source held less. This runs in every harness
+  test, including `make crash-long` and `make demo`.
+- 8 mutants (`python3 tests/mutants.py reads`): each of the three
+  reads returning without waiting; balance and snapshot noting the log
+  end before taking their locks; the two rejections answered early;
+  `lg_settle` waiting only for `OK`/`DUPLICATE` (the old code).
+
+### Evidence, as run on this commit
+
+Machine as in section 7. Each line is a command and what it printed.
+
+```
+$ make test                      # 7 min 40 s, every suite: OK
+  test-model 26 tests | test-diff 3000 + 1000 (ASan) seeds
+  test-stress 7 x 3 builds | test-recovery 11 + 11 (ASan)
+  test_torn 15 + 15 (ASan) | test-crash 8 | test-groupcommit 8
+$ make mutants                   # 11 min
+  passed    [..] control: unchanged core        (7 groups)
+  65/65 mutants killed            (41 from before, 8 wal, 8 reads, 8 torn)
+$ make crash-long
+  crash harness: 1000 kill -9, sync=full, 64 threads, 143 s
+    transfers that survived in the logs : 497180
+    transfer calls that returned        : 894221 (OK=490841, DUPLICATE=362042, INSUFFICIENT_FUNDS=38717, INVALID=2621)
+    tail damage injected                : append=106, flip=89, hole=89, none=362, rot=90, truncate=82, truncate+append=101, truncate_to_floor=81
+    bytes of torn tail cut by recovery  : 301549
+    damaged logs refused, then restored : 91
+    reads explained by the durable log  : balance=217454, lookup=107080, snapshot=14174, INSUFFICIENT_FUNDS=38717
+    I1-I6 held after every recovery     : yes (1000 of 1000)
+$ make test-groupcommit          # excerpt
+  ok   6 observers waited for the batch in flight
+  ok   readers waited for the batch behind the one in flight
+  ok   buffer-full appender: nobody returned early, nothing lost (full_waits=1)
+  storm: 23451 transfers applied, 12178 batches, buffer found full 13829 times; reads checked: balance=12142 lookup=5925 snapshot=783
+  TSan storm: 6235 transfers, buffer found full 3518 times, no report
+$ make norm
+  norm: OK (42 header not stamped)
+```
+
+Read the 1000-kill numbers against section 6: fewer transfers per
+kill than before (497,180 against 1,269,501). The workers now spend
+part of each iteration on reads, every read and every rejection waits
+for a disk flush, and the Python check per kill is heavier. It is a
+different workload, not a measured slowdown of transfers; `make bench`
+(section 7 and README) is the throughput measurement.
+
+What the round cost in throughput, old code against new on the same
+machine (this VM is not the one of section 7: 2.10 GHz), `sync=full`,
+64 accounts, 40,000 transfers per run, five runs each:
+
+```
+$ git archive 697ecdd | tar -x -C /tmp/old && make -C /tmp/old build/stress
+$ X --threads T --ops $((40000/T)) --accounts 64 --hot-pct 0 --seed R --wal W --sync full
+threads=1  old: 6008 6147 5729 5894 6079      new: 6036 6318 6429 5777 6257
+threads=64 old: 37393 40094 40903 36137 39132 new: 34958 36184 34951 33382 34947
+```
+
+One thread: no difference beyond noise. 64 threads: about 11% slower
+(medians 39,132 and 34,951). Candidates are the rejections that now
+wait for a flush (D27) and the 17 extra bytes per batch; they were not
+measured separately.
+
+### Existing tests whose expectations changed
+
+Nothing was deleted or loosened; these were adapted, and why:
+
+- `tests/test_recovery.py`: hand-built logs carry commit records (a
+  format change). `test_every_byte_corrupted` used to require "keep
+  the records before the damaged one" at every position; it now
+  requires that only in the last batch and a refusal everywhere else.
+  The old expectation was the defect. `test_intact_but_impossible...`:
+  the impossible record is now committed (uncommitted it is just a
+  torn tail, which is also asserted), plus a variant inside a batch of
+  two. `test_rubbish...`: the "replayed old record" tail was skipped
+  before; it is now tested (cut).
+- `tests/crash_harness.py`, `tests/crash_worker.c`: reads, the
+  explain step, refusal handling, two more damage kinds, a sanitizer
+  check on the killed worker's output.
+- `tests/mutants.py`: three new groups; every group first runs a
+  control (the unchanged core must pass in the mutant setup); the
+  unittest run stops at the first failure (a hanging mutant used to
+  wait out every timeout).
+
+### Found while breaking it
+
+- The two defects above (D25, D27).
+- My first expectation in `test_several_damaged_bytes` was wrong, and
+  the C code and the Python rule agreed with each other against it:
+  with two damaged places, one in the commit record of an acknowledged
+  batch and one in the commit record of the batch after it, no commit
+  record survives behind the damage and recovery cuts. That is a real
+  remaining hole, now pinned by
+  `test_known_limit_every_later_commit_record_destroyed` and listed
+  below.
+- The first run of the new mutant groups took more than 15 minutes:
+  the "only one waiter woken" mutant hangs, and each test waited out
+  its own long timeout. Mutant runs now stop at the first failure.
+- In the harness the new "must refuse" branch was never taken at
+  first (0 of the first 190 kills): ordinary tail damage almost never lands in
+  front of a later batch, because at most one batch is unsynced. The
+  "rot" damage kind exists to exercise that branch on real logs.
+
+### What is still not verified
+
+Recovery (gap 2):
+
+- A damaged **last** batch that had been acknowledged. In the file it
+  is identical to a torn write, and it is cut. No log format can
+  decide this from the file alone; it needs a second copy
+  (replication) or a durable record of the acknowledged length
+  elsewhere.
+- **Two damaged places** that destroy the commit record of an
+  acknowledged batch and every commit record after it, all within the
+  last 1 MiB: cut (pinned by a test). A batch tag in every data record
+  would close it (8 bytes per record, and the record would have to be
+  encoded under the log lock).
+- A **stale complete batch** at exactly the right offset that the
+  rules accept is believed (pinned by a test). A generation number in
+  the commit record, bumped at every recovery, would close it.
+- Real power loss, lying disks, kernel bugs: unchanged from M3. The
+  "hole" and "rot" damage kinds are imitations written from an
+  understanding of what a power cut may do, not observations of one.
+
+Group commit (gap 1):
+
+- The gate test proves the three interleavings it scripts. The storms
+  cover the interleavings that happened to occur. The TLA+ model
+  (section 10) covers every interleaving of a simplified design at
+  small sizes. None of these explores every schedule of the C code.
+- The failure path inside the buffer-full loop (the log fails while
+  an appender waits for room) is only reached by the disk-full test,
+  not on purpose.
+- `LG_SYNC_PROCESS` has no gate test (there is no `fdatasync` to
+  hold); it is covered by storms and kill -9 only.
+
+Reads (gap 3):
+
+- `explain` trusts the `durable` offset the ledger itself reports. A
+  bug that both shows state early and reports `durable` too high
+  would pass it; that combination is covered by the gate test and by
+  kills, not by `explain`.
+- `lg_count` and `lg_stats` are diagnostics and do not wait: an
+  account id can be visible through `lg_count` before its create
+  record is durable. `lg_verify` waits (it is built on `lg_snapshot`).
+- A lookup that finds nothing makes no claim that can be checked after
+  a crash, except against the same thread's earlier `OK`.
 
 ## Decision log
 
@@ -552,13 +884,19 @@ sections 5 and 6 are prose, not machine-checked.
 | D15 | When to acknowledge | After the record is durable, with group commit | (a) fsync per transfer under the locks: correct, a few thousand transfers/s at most. (b) Acknowledge first, flush in the background: fast, but an acknowledged transfer can vanish, which breaks I5. | Group commit keeps the strict guarantee and shares each disk flush among all waiting threads. |
 | D16 | Locks during the disk wait | Released ("early lock release") | Holding account locks until durable | Holding them would serialise every transfer on a hot account behind a disk flush. Safe because the record is appended under the locks, so log order respects dependencies, and because readers also wait for durability. |
 | D17 | I/O error handling | Fail-stop, never retry | Retry the write or fsync | After a failed fsync Linux may discard the dirty pages and report success on retry. Stopping and recovering from the file is the only state one can vouch for. |
-| D18 | Torn tail vs. corruption | Cut at most one batch (1 MiB) of invalid tail; refuse anything larger, and refuse intact records the rules reject | Always cut at the first bad record; or never cut | "Always cut" can silently delete arbitrarily many good records behind one flipped bit. "Never cut" cannot restart after an ordinary crash. The 1 MiB bound is exactly what one interrupted batch can explain. |
+| D18 | Torn tail vs. corruption (superseded by D25, kept as the reason for it) | Cut at most one batch (1 MiB) of invalid tail; refuse anything larger, and refuse intact records the rules reject | Always cut at the first bad record; or never cut | "Always cut" can silently delete arbitrarily many good records behind one flipped bit. "Never cut" cannot restart after an ordinary crash. The 1 MiB bound is exactly what one interrupted batch can explain. |
 | D19 | Recovery code path | Replay through the normal `lg_create` / `lg_transfer` | A dedicated fast apply routine | One implementation of the rules. A valid log must replay with `OK` for every record; anything else is treated as corruption. |
 | D20 | Reads and durability | `lg_balance`, snapshots and `DUPLICATE` wait for the log to be durable up to the moment they looked | Returning in-memory state immediately | Otherwise a caller could see a balance, the machine could crash, and the money would be gone again: an observable lie even though no `OK` was lost. Cost: a read may wait for one disk flush. |
 | D21 | Checksum | CRC-32 (zlib) | CRC-32C, a cryptographic hash | Detects torn and garbled records, which is the job. Being the zlib polynomial lets Python's `zlib.crc32` verify the C code independently. Not a defence against deliberate tampering. |
 | D22 | No snapshots / log compaction | Out of scope | Periodic checkpoint + log truncation | Recovery time and file size grow with history. A checkpoint needs its own atomic-replace protocol and tests; left out to keep M0-M4 solid. Listed as a limitation. |
 | D23 | One process per log | `flock` on the log file, second opener refused | Trusting the operator | Two writers would interleave records and each would hold a stale in-memory state. The kernel releases the lock on any death, kill -9 included. |
 | D24 | M5 choice | Property test with shrinking (hypothesis, optional) | TLA+ spec | Cheaper, runs against the real code, and reuses the model. A TLA+ spec of group commit + recovery would be the natural next step. |
+
+| D25 | Telling a torn tail from corruption | Every batch ends with a commit record naming the batch's start offset. Recovery keeps complete batches; it cuts the rest only if nothing proves a later write behind it; otherwise it refuses and says why | (a) D18, the old rule: cut at the first bad record if at most 1 MiB follows. (b) Refuse on any damage at all. (c) A batch tag in every data record | D18 lost acknowledged transfers without an error: one flipped bit in an old record cut every later record off, as long as they fit in 1 MiB (reproduced in section 9). The reason is that the old format could not tell "the batch in flight" from "an old batch": both are just bad bytes followed by other bytes. The commit record carries that missing fact. (b) would refuse after every ordinary crash. (c) closes one more case (section 9, limits) for 8 bytes per record and encoding under the log lock; not done, stated. Cost of D25: 17 bytes and no extra system call per batch; a log written before this round is not readable (no migration: there are no deployed logs). |
+| D26 | Records of a batch without its commit record | Dropped at recovery, even if each is intact | Keeping the intact prefix of a torn batch (the old behaviour) | Nobody was told `OK` for them (I5 allows "completely absent"), and dropping them makes "which batch does this record belong to?" answerable. It also means a batch is atomic, which the old format did not give. |
+| D27 | Rejections decided by looking at state | `INSUFFICIENT_FUNDS`, and `INVALID` for an id already used with other values, wait for the log to be durable up to the moment they looked, like a read (D20) | Answering at once (the behaviour until this round) | Found while writing the gap-3 tests: a rejection can be caused by a debit that is still in the log buffer. Crash, the debit is gone, and the caller holds an answer the recovered ledger never could have given. Not a lost `OK`, but the same class of lie as D20. Cost: such a rejection may wait for one flush. `UNKNOWN_ACCOUNT` and the stateless `INVALID`s (amount <= 0, same account) do not wait: they depend on nothing a crash can take back. |
+| D28 | How to test "nothing observable before durable" | (a) `tests/gate.c`: the linker option `--wrap=fdatasync` routes the ledger's `fdatasync` to a test function that blocks until the test releases it, so the test decides when each batch becomes durable. (b) In the crash harness every answer carries the `durable` offset the ledger reported right after the call, and must be explainable by the log up to that offset | Only more kill -9 runs | A kill has to land in a window of a few hundred microseconds to expose such a bug; the gate makes the window as long as the test likes, with no timing luck, and no change to the core (not even a test hook). (b) checks the rule on every call of every run, kill or no kill. |
+| D29 | Why the open failed | `t_lg_config.why` (optional `int *`) receives a reason code; the CLI prints a sentence | A global "last error"; only `CORRUPT` | "Refuse and say why". A global is forbidden by the Norm and wrong with two ledgers in one process. |
 
 ## What Landi must understand
 

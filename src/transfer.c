@@ -3,15 +3,16 @@
 /*
 ** The id was applied before as old. Same request: DUPLICATE, and the
 ** caller must wait until the original is durable before saying so
-** (hence the LSN). Anything else under the same id is an error.
+** (hence the LSN). Anything else under the same id is an error, and
+** that answer waits too: it also reveals that the id is taken.
 */
 static t_lg_rc	xfer_replay(t_ledger *l, const t_lg_xfer *old,
 					const t_lg_xfer *x, uint64_t *lsn)
 {
 	if (old->from != x->from || old->to != x->to)
-		return (LG_INVALID);
+		return (lg_reject(l, LG_INVALID, lsn));
 	if (old->amount != x->amount)
-		return (LG_INVALID);
+		return (lg_reject(l, LG_INVALID, lsn));
 	*lsn = lg_tail(l);
 	return (LG_DUPLICATE);
 }
@@ -49,7 +50,7 @@ static t_lg_rc	xfer_apply(t_ledger *l, const t_lg_xfer *x, uint64_t *lsn)
 
 	rc = xfer_check(l, x);
 	if (rc != LG_OK)
-		return (rc);
+		return (lg_reject(l, rc, lsn));
 	s = lg_shard(l, x->id);
 	*lsn = lg_log(l, LG_REC_XFER, x);
 	l->acc[x->from].balance -= x->amount;

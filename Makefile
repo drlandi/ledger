@@ -11,7 +11,20 @@ UT		= $(PY) -m unittest discover -s tests -p
 TSAN	= -fsanitize=thread
 
 all: $(B)/driver $(B)/stress $(B)/ledger $(B)/crash_worker \
-	$(B)/crash_worker_tiny $(B)/crash_worker_tsan
+	$(B)/crash_worker_tiny $(B)/crash_worker_tsan $(B)/gate $(B)/gate_tsan
+
+# The gate tool decides when fdatasync returns (see tests/gate.c).
+GATE	= -DLG_WAL_BUF=128 -Wl,--wrap=fdatasync
+
+$(B)/gate: tests/gate.c $(LIB) $(HDR)
+	@mkdir -p $(B)
+	@echo "  CC  $@"
+	@$(CC) $(CFLAGS) $(GATE) -o $@ tests/gate.c $(LIB)
+
+$(B)/gate_tsan: tests/gate.c $(LIB) $(HDR)
+	@mkdir -p $(B)
+	@echo "  CC  $@"
+	@$(CC) $(CFLAGS) $(TSAN) $(GATE) -o $@ tests/gate.c $(LIB)
 
 $(B)/crash_worker_tsan: tests/crash_worker.c $(LIB) $(HDR)
 	@mkdir -p $(B)
@@ -79,6 +92,13 @@ test-stress: $(B)/stress $(B)/stress_tsan $(B)/stress_asan
 test-recovery: $(B)/ledger $(B)/ledger_asan
 	$(UT) 'test_recovery.py'
 	LEDGER=$(B)/ledger_asan $(UT) 'test_recovery.py'
+	$(UT) 'test_torn.py'
+	LEDGER=$(B)/ledger_asan $(UT) 'test_torn.py'
+
+# Gaps 1 and 3: fdatasync held shut by the test; buffer-full storms
+# under ThreadSanitizer and kill -9; reads checked against the log.
+test-groupcommit: all
+	$(UT) 'test_groupcommit.py'
 
 test-crash: all
 	$(UT) 'test_crash.py'
@@ -113,9 +133,10 @@ norm:
 		-e GLOBAL_VAR_DETECTED | grep -v -x -e '.*: Error!' \
 		&& exit 1 || echo "norm: OK (42 header not stamped)"
 
-test: test-model test-diff test-stress test-recovery test-crash
+test: test-model test-diff test-stress test-recovery test-crash \
+	test-groupcommit
 
 clean:
 	rm -rf $(B) tests/__pycache__
 
-.PHONY: all test test-model test-diff test-stress test-recovery test-crash crash-long demo bench test-property mutants norm clean
+.PHONY: all test test-model test-diff test-stress test-recovery test-crash test-groupcommit crash-long demo bench test-property mutants norm clean
