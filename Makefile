@@ -139,12 +139,11 @@ $(TLA_JAR):
 model: $(TLA_JAR)
 	$(PY) model/check.py $(TLA_JAR)
 
-# 42 Norm. The 42 file header carries a student login and e-mail, so it
-# is left for the author to stamp; every other rule must pass.
+# 42 Norm on the core (src, include), file header included.
 norm:
-	@norminette src include | grep -v -e INVALID_HEADER -e ': OK!' \
+	@norminette src include | grep -v -e ': OK!' \
 		-e GLOBAL_VAR_DETECTED | grep -v -x -e '.*: Error!' \
-		&& exit 1 || echo "norm: OK (42 header not stamped)"
+		&& exit 1 || echo "norm: OK"
 
 test: test-model test-diff test-stress test-recovery test-crash \
 	test-groupcommit

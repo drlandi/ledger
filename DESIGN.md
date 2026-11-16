@@ -98,8 +98,8 @@ Evidence (M1):
   (off-by-one in the funds check, credit side dropped, id not
   remembered, hash probe skipping a slot, ...). The differential test
   kills 18/18.
-- `make norm`: norminette passes on `src/` and `include/` apart from
-  the file header (N1 below).
+- `make norm`: norminette passes on `src/` and `include/`, file
+  header included (the only notice is N1 below).
 
 Found while breaking it:
 
@@ -119,8 +119,7 @@ Found while breaking it:
 
 | # | Deviation | Why |
 |---|---|---|
-| N1 | No 42 file header | It embeds a student login and e-mail; left for the author to stamp. `make norm` filters only this message. |
-| N2 | One `static const` global (`g_rc_names`) | Read-only name table; the Norm tolerates const globals (norminette emits a notice, not an error). |
+| N1 | One `static const` global (`g_rc_names`) | Read-only name table; the Norm tolerates const globals (norminette emits a notice, not an error). |
 
 ## 5. Concurrency (M2)
 

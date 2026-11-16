@@ -72,7 +72,6 @@ a VM.
   idempotency-table memory; per-account locks lose to the global lock
   on two hot accounts and single-threaded (DESIGN 5).
 - `sync=process` slows down with many threads (DESIGN 7).
-- 42 file headers are not stamped (needs the author's login).
 - `tests/mutants.py` patterns are tied to the source text; the script
   checks them up front and names the stale one after a refactor.
 - `make test` takes about 8 minutes; the slow part is

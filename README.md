@@ -131,7 +131,7 @@ make test-groupcommit  8 tests OK: fdatasync gate (plain + TSan), buffer-full st
 make crash-long        1000 kills, 497,180 transfers committed, 91 damaged logs refused, I1-I6 held 1000 of 1000
 make demo              400 kills, 1,199,324 transfers committed, I1-I6 held 400 of 400
 make mutants           65/65 planted bugs caught; the unchanged core passes every mutant setup
-make norm              OK (only the 42 file header is not stamped)
+make norm              OK (42 Norm, including the file header)
 make model             10 TLC runs as expected: 4 clean (up to 10,182,954 states), 3 planted bugs found, 3 reachability checks
 ```
 
@@ -259,6 +259,15 @@ Python 3.8+ (standard library only). Optional: `strace` (one test is
 skipped without it), `norminette` (`make norm`), Java 11+ for
 `make model`. ThreadSanitizer and
 AddressSanitizer come with the compiler.
+
+On Ubuntu 24.04 and other recent kernels, ThreadSanitizer aborts with
+"unexpected memory mapping" (exit 66) because of high address-space
+randomization. This is not a ledger bug. Lower it until the next
+reboot, then run the stress tests:
+
+```
+sudo sysctl vm.mmap_rnd_bits=28
+```
 
 ## Known limitations
 
