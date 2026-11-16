@@ -40,7 +40,8 @@ transfer ledger in C, correctness shown by tests. Design: `DESIGN.md`.
     `make test-groupcommit`.
   - `make mutants`: 65/65 (41 old, 24 new) plus a control per group.
     `make test` OK (about 8 min). `make crash-long` 1000/1000.
-- Not yet done: Part 1b (plain-language section in DESIGN), Part 2
+- Part 1b done: DESIGN "Decisions in plain language" (D3, D4, the
+  three gaps). Not yet done: Part 2
   (TLA+ model; `model/` holds an unchecked draft if present).
 
 ## Next

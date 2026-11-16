@@ -898,6 +898,137 @@ Reads (gap 3):
 | D28 | How to test "nothing observable before durable" | (a) `tests/gate.c`: the linker option `--wrap=fdatasync` routes the ledger's `fdatasync` to a test function that blocks until the test releases it, so the test decides when each batch becomes durable. (b) In the crash harness every answer carries the `durable` offset the ledger reported right after the call, and must be explainable by the log up to that offset | Only more kill -9 runs | A kill has to land in a window of a few hundred microseconds to expose such a bug; the gate makes the window as long as the test likes, with no timing luck, and no change to the core (not even a test hook). (b) checks the rule on every call of every run, kill or no kill. |
 | D29 | Why the open failed | `t_lg_config.why` (optional `int *`) receives a reason code; the CLI prints a sentence | A global "last error"; only `CORRUPT` | "Refuse and say why". A global is forbidden by the Norm and wrong with two ledgers in one process. |
 
+## Decisions in plain language
+
+For each: the choice, an everyday example, the price, and the question
+an interviewer would ask.
+
+### D3 - a rejected transfer does not use up its key
+
+- The choice: the ledger remembers an idempotency key only when the
+  transfer was applied (`OK`). A rejected transfer leaves no trace.
+- Example: you send transfer #77, R$100 to a friend, with only R$50 in
+  the account. Answer: `INSUFFICIENT_FUNDS`. Your salary of R$100
+  arrives. Your phone, which never forgot #77, sends it again. Now it
+  is applied: `OK`. Send #77 a third time: `DUPLICATE`, nothing moves.
+- This was a judgment call. The brief says a key must make a transfer
+  happen at most once; it does not say what a key means after a
+  rejection. I chose "nothing happened, so nothing is remembered".
+- The alternative: remember the rejection too. Then the retry of #77
+  after the salary would answer `INSUFFICIENT_FUNDS` again, forever,
+  and the user would need a new key (#78) to pay. That is the
+  "a key names one attempt and its one final answer" reading (payment
+  APIs such as Stripe's replay the stored first response this way).
+- Price of my choice: the same request can get two different answers
+  at two times, so a client must not treat a rejection as final. Price
+  of the alternative: rejections must be written to the durable log
+  (they would have to survive a crash too), and the key table grows
+  with every failed attempt.
+- What does not change either way: money moves at most once per key.
+- Interviewer: "A client retries a rejected transfer an hour later and
+  it goes through. Bug or feature?" Answer: a stated choice (D3); here
+  is the alternative and what it would cost; switching is a small
+  change (log a "rejected" record, store the code in the key table).
+
+### D4 - what DUPLICATE means
+
+- The choice: `DUPLICATE` means exactly one thing: "this very
+  transfer, same key, same accounts, same amount, was already applied;
+  I did nothing now."
+- Example: you pay R$100 with key #77, the app shows a spinner, the
+  connection drops. You do not know if it went through. The app sends
+  #77 again. `OK` means "it had not, now it has". `DUPLICATE` means
+  "it had". Either way you paid once. If the app sends #77 with R$101,
+  the answer is `INVALID`: same key, different request, refused.
+- Why not return the original answer again: because of D3 the only
+  answer ever stored is `OK`, so "`DUPLICATE`" already tells the
+  client everything, and it also tells it that this call was a replay.
+- One more rule hides here: `DUPLICATE` is only said after the
+  original transfer is safely on disk. Otherwise: "yes, already
+  applied", crash, and it was not.
+- Price: the client must treat `OK` and `DUPLICATE` both as success.
+- Interviewer: "The client got a timeout. What should it do?" Retry
+  with the same key until it gets `OK` or `DUPLICATE`.
+
+### Gap 1 - a full log buffer while holding account locks
+
+- The situation: transfers are collected in a buffer and written to
+  disk together. If the buffer is full, the next transfer cannot put
+  its record in. It already holds the locks of its two accounts.
+- The choice: it keeps the locks, gets the buffer written (itself, or
+  by waiting for the thread that is writing), then adds its record,
+  then changes the balances.
+- Example: a cashier with a full page in the cash book does not serve
+  the customer and write it down "later on the next page when there is
+  time". She turns the page first, with the customer still at the
+  counter. The people queuing for that same counter wait a moment
+  longer.
+- Why: the book must list the entries of one account in the order they
+  happened. If she let go of the account first, a second transfer
+  could spend the money and reach the book before the first one.
+  After a crash the book could then contain the spending without the
+  income.
+- Price: the two accounts stay locked for one disk write (about
+  0.2 ms here). With the real 1 MiB buffer that is rare; the tests use
+  a 128-byte buffer to make it happen thousands of times per second.
+- Interviewer: "Why not release the locks while you wait for the
+  disk?" Because the record is not in the log yet; order in the log is
+  what makes early lock release safe everywhere else.
+
+### Gap 2 - torn tail or corruption
+
+- The situation: after a crash the end of the log file can be rubbish.
+  That is normal: the last write was interrupted. But rubbish can also
+  be a damaged disk block in the middle of old, confirmed data.
+- The choice: each write to disk ends with a small "end of batch"
+  mark. Rubbish at the very end, with no such mark of a later batch
+  behind it, is an interrupted write: cut it off and start. Rubbish
+  with a later batch behind it means confirmed transfers are damaged:
+  do not start, do not touch the file, say why.
+- Example: a notebook where every evening you sign under the day's
+  entries. Half a page without a signature at the end: you were
+  interrupted, tear it out. A smudged page in the middle, with signed
+  days after it: you do not tear out everything after the smudge and
+  carry on as if those days never happened. You stop and get help.
+- The old rule tore out everything after the smudge if it was less
+  than 1 MiB, and said "OK". Four confirmed transfers, one flipped
+  bit in the second: balance 100 instead of 400, no error.
+- Price: 17 bytes per batch; and after real corruption the ledger
+  refuses to start until a person restores or repairs the file. For
+  money, "stopped" is better than "wrong".
+- Interviewer: "Your last batch is damaged and was already confirmed.
+  What now?" It is cut, and that is the limit of this design: nothing
+  in the file can tell that batch from an interrupted write. Closing
+  it needs a second copy of the log (replication) or a durable note
+  of the confirmed length elsewhere.
+
+### Gap 3 - reads and DUPLICATE wait for the disk too
+
+- The rule: the ledger never shows anything that a crash could still
+  take back. Not a balance, not "this transfer exists", not
+  `DUPLICATE`, not a snapshot, and (new) not a rejection that was
+  caused by something still unwritten.
+- Example: your friend sends you R$100. Your app shows R$100. You hand
+  him the goods. The bank's machine loses power; when it is back, the
+  transfer is gone, because it was shown before it was written to
+  disk. No `OK` was lost (the sender never got one), yet you were
+  shown money that never existed. So the balance request waits until
+  everything it includes is on disk.
+- The new part, same example reversed: your account is emptied by a
+  payment that is not on disk yet; your rent is refused with
+  `INSUFFICIENT_FUNDS`; crash; the payment never happened. You were
+  refused because of something that did not happen. So that refusal
+  now waits for the disk as well.
+- Price: a read may wait for one disk write (about 0.2 ms here)
+  instead of returning at once.
+- How it is tested: a test holds the disk "shut" and checks that seven
+  different kinds of caller are all still waiting; then opens it once
+  and checks who may return, step by step (`tests/gate.c`).
+- Interviewer: "Reads do not change anything. Why would a read ever
+  touch the disk?" It does not write; it waits for writes it has
+  already seen the effect of. And: "what would it cost to skip this?"
+  Speed is gained, and a balance becomes a hint, not a fact.
+
 ## What Landi must understand
 
 ### M0 - model and judge
