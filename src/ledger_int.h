@@ -28,8 +28,12 @@
 **   crc  = CRC-32 of the len field followed by type + body
 **   type = 1 create:   id u64, initial i64, flags u32      (len 21)
 **          2 transfer: id u64, from u64, to u64, amount i64 (len 33)
-** LG_WAL_BUF is the size of the group-commit buffer, so it is also the
-** most that one interrupted write can tear.
+**          3 commit:   start u64                             (len 9)
+** Every write batch ends with one commit record; start is the file
+** offset where that batch began. Records are only believed once the
+** commit record of their batch is there. LG_COMMIT is its size on disk.
+** LG_WAL_BUF is the size of the group-commit buffer (commit record
+** included), so it is also the most that one interrupted write can tear.
 */
 # define LG_WAL_MAGIC "LGWAL001"
 # define LG_WAL_HDR 8
@@ -37,8 +41,11 @@
 # define LG_REC_MAX 41
 # define LG_REC_CREATE 1
 # define LG_REC_XFER 2
+# define LG_REC_COMMIT 3
 # define LG_LEN_CREATE 21
 # define LG_LEN_XFER 33
+# define LG_LEN_COMMIT 9
+# define LG_COMMIT 17
 # ifndef LG_WAL_BUF
 #  define LG_WAL_BUF 1048576
 # endif
@@ -88,6 +95,7 @@ typedef struct s_wal
 	uint64_t		tail;
 	uint64_t		durable;
 	uint64_t		flushes;
+	uint64_t		full_waits;
 	uint32_t		crc[256];
 }	t_wal;
 
@@ -158,5 +166,11 @@ int			lg_dead(t_ledger *l);
 uint64_t	lg_tail(t_ledger *l);
 uint64_t	lg_log(t_ledger *l, uint8_t type, const t_lg_xfer *x);
 t_lg_rc		lg_settle(t_ledger *l, t_lg_rc rc, uint64_t lsn);
+t_lg_rc		lg_reject(t_ledger *l, t_lg_rc rc, uint64_t *lsn);
+void		lg_wal_seal(t_wal *w);
+uint64_t	lg_scan_commits(const uint32_t *tab, const t_lg_img *img);
+int			lg_scan_tail(const uint32_t *tab, const t_lg_img *img,
+				uint64_t end);
+t_lg_rc		lg_why(t_ledger *l, int why);
 
 #endif

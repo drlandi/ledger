@@ -60,7 +60,22 @@ typedef struct s_lg_xfer
 # define LG_SYNC_PROCESS 1
 
 /*
+** Why lg_open refused a log with LG_CORRUPT (see t_lg_config.why).
+** FOREIGN: the file does not start like a ledger log.
+** LONG_TAIL: more unreadable bytes at the end than one batch can hold.
+** BEHIND: data that was written after the damaged part exists, so the
+** damaged part had been acknowledged; cutting it would lose transfers.
+** RULES: a committed record that the ledger's own rules reject.
+*/
+# define LG_WHY_NONE 0
+# define LG_WHY_FOREIGN 1
+# define LG_WHY_LONG_TAIL 2
+# define LG_WHY_BEHIND 3
+# define LG_WHY_RULES 4
+
+/*
 ** wal_path NULL: in-memory ledger, nothing survives the process.
+** why: optional; receives one of LG_WHY_* when lg_open fails.
 */
 typedef struct s_lg_config
 {
@@ -68,6 +83,7 @@ typedef struct s_lg_config
 	int			lock_mode;
 	int			sync_mode;
 	const char	*wal_path;
+	int			*why;
 }	t_lg_config;
 
 /*
@@ -85,6 +101,8 @@ typedef struct s_lg_snap
 ** recovered: records replayed at open. truncated: bytes of torn tail
 ** cut off at open. tail: log size including buffered records.
 ** durable: log size known to be on disk. flushes: write batches.
+** full_waits: times an appender found the commit buffer full and had
+** to wait for, or perform, a flush while holding its account locks.
 */
 typedef struct s_lg_stats
 {
@@ -93,6 +111,7 @@ typedef struct s_lg_stats
 	uint64_t	tail;
 	uint64_t	durable;
 	uint64_t	flushes;
+	uint64_t	full_waits;
 }	t_lg_stats;
 
 t_lg_rc		lg_open(const t_lg_config *cfg, t_ledger **out);

@@ -48,33 +48,38 @@ static t_lg_rc	replay_one(t_ledger *l, const t_lg_rec *r)
 }
 
 /*
-** Applies records until the first one that is incomplete or fails its
-** checksum; img->end is left there. A record that is intact but that
-** the ledger rejects (overdraw, repeated id, ...) was never written by
-** this program in this position: that is corruption, not a torn tail.
+** Applies the records of every complete batch (img->end was set to
+** the end of the last one by lg_scan_commits) and leaves img->end
+** there. A record that is intact and committed but that the ledger
+** rejects (overdraw, repeated id, ...) was never written by this
+** program in this position: that is corruption, not a torn tail.
 */
 static t_lg_rc	replay(t_ledger *l, const uint32_t *tab, t_lg_img *img)
 {
 	t_lg_rec	r;
-	size_t		n;
+	uint64_t	stop;
 
+	stop = img->end;
 	img->end = LG_WAL_HDR;
-	n = lg_rec_decode(tab, img->p + img->end, img->size - img->end, &r);
-	while (n != 0)
+	while (img->end < stop)
 	{
+		img->end += lg_rec_decode(tab, img->p + img->end,
+				stop - img->end, &r);
+		if (r.type == LG_REC_COMMIT)
+			continue ;
 		if (replay_one(l, &r) != LG_OK)
-			return (LG_CORRUPT);
-		img->end += n;
+			return (lg_why(l, LG_WHY_RULES));
 		l->recovered++;
-		n = lg_rec_decode(tab, img->p + img->end, img->size - img->end, &r);
 	}
 	return (LG_OK);
 }
 
 /*
-** A crash can tear at most the one batch that was being written, and
-** a batch is at most LG_WAL_BUF bytes. More invalid bytes than that
-** cannot be a torn tail, so the file is left alone and open fails.
+** What follows the last complete batch is cut off only if it can be
+** explained as the one batch a crash interrupted: at most LG_WAL_BUF
+** bytes (a batch is never larger), and nothing in it that proves a
+** later write (lg_scan_tail). Otherwise the damage sits in data that
+** was acknowledged; the file is left alone and open fails.
 */
 static t_lg_rc	recover_img(t_ledger *l, t_wal *w, t_lg_img *img)
 {
@@ -82,11 +87,15 @@ static t_lg_rc	recover_img(t_ledger *l, t_wal *w, t_lg_img *img)
 
 	hdr = lg_hdr_check(img);
 	if (hdr < 0)
-		return (LG_CORRUPT);
+		return (lg_why(l, LG_WHY_FOREIGN));
 	img->end = 0;
-	if (hdr == 1 && replay(l, w->crc, img) != LG_OK)
-		return (LG_CORRUPT);
+	if (hdr == 1)
+		img->end = lg_scan_commits(w->crc, img);
 	if (img->size - img->end > LG_WAL_BUF)
+		return (lg_why(l, LG_WHY_LONG_TAIL));
+	if (hdr == 1 && lg_scan_tail(w->crc, img, img->end) != 0)
+		return (lg_why(l, LG_WHY_BEHIND));
+	if (hdr == 1 && replay(l, w->crc, img) != LG_OK)
 		return (LG_CORRUPT);
 	l->truncated = img->size - img->end;
 	return (lg_wal_start(w, l->cfg.wal_path, img));

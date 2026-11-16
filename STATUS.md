@@ -26,17 +26,48 @@ transfer ledger in C, correctness shown by tests. Design: `DESIGN.md`.
 - M5 (stretch): optional hypothesis test with shrinking,
   `make test-property`. No TLA+ spec.
 
+- Follow-up round, Part 1 (the three gaps; DESIGN section 9):
+  - Gap 2 was a real defect: mid-log damage silently dropped
+    acknowledged transfers. Fixed with a commit record per batch
+    (new log format, D25/D26); recovery cuts only what one interrupted
+    write explains and otherwise refuses with a reason.
+    `tests/test_torn.py`.
+  - Gap 3 found a second, smaller defect: state-dependent rejections
+    were answered before durable. Fixed (D27). Reads are now checked
+    in the crash harness (`explain`) and by `tests/gate.c`.
+  - Gap 1: no defect found; `tests/gate.c` (fdatasync held by the
+    test via `--wrap`) and 128-byte-buffer storms,
+    `make test-groupcommit`.
+  - `make mutants`: 65/65 (41 old, 24 new) plus a control per group.
+    `make test` OK (about 8 min). `make crash-long` 1000/1000.
+- Part 1b: DESIGN "Decisions in plain language" (D3, D4, the three
+  gaps).
+- Part 2: TLA+ model `model/Ledger.tla`, instance `model/MC.tla`,
+  checked with TLC by `make model` (about 5 min; needs Java; fetches
+  `build/tla2tools.jar` once). 4 clean configurations (up to 10.2M
+  states), 3 planted bugs each found, 3 reachability probes. DESIGN
+  section 10 maps actions to C functions and lists what the model
+  does not show (no bytes: gap 2 is not modelled; not the C code).
+
 ## Next
 
-Nothing is required. Natural extensions, in order of value:
-checkpoint + log compaction; pre-allocated idempotency table; TLA+
-model of group commit and recovery; a real power-loss test in a VM.
+Open items, in order of value:
+model the commit-record rule (torn / rotten batches) in TLA+;
+a batch tag per data record and a generation number in the commit
+record (the two "known limit" tests in `tests/test_torn.py` would then
+flip to "refuse"); a repair tool for a refused log; checkpoint + log
+compaction; pre-allocated idempotency table; a real power-loss test in
+a VM.
 
 ## Known issues / limits
 
 - Real power loss is simulated (kill -9 + tail damage), not tested.
+- A damaged last batch is cut even if it had been acknowledged; two
+  narrower cases are pinned as `test_known_limit_*` (DESIGN 9).
+- A refused log needs a person: there is no repair tool.
+- Logs from before the commit-record format are not readable.
 - Log, recovery time and idempotency memory grow without bound.
-- Mid-log corruption is detected, not repaired.
+- `lg_count` / `lg_stats` do not wait for durability (diagnostics).
 - In-memory throughput is capped near 4.5M/s by page faults on
   idempotency-table memory; per-account locks lose to the global lock
   on two hot accounts and single-threaded (DESIGN 5).
@@ -44,10 +75,14 @@ model of group commit and recovery; a real power-loss test in a VM.
 - 42 file headers are not stamped (needs the author's login).
 - `tests/mutants.py` patterns are tied to the source text; the script
   checks them up front and names the stale one after a refactor.
+- `make test` takes about 8 minutes; the slow part is
+  `tests/test_torn.py` under ASan (1 MiB batches).
 
 ## Conventions
 
 - C core in `src/`, public header `include/ledger.h`, 42 Norm checked
   with `norminette` (`make norm`). Test code is exempt.
 - Tests are Python stdlib `unittest` in `tests/`; C test tools there too.
+- Never delete scratch directories with `rm -rf` globs in this
+  environment (blocked); use `mktemp -d`.
 - Every test reports to `invariants.check_all`.

@@ -40,5 +40,6 @@ void	lg_stats(t_ledger *l, t_lg_stats *s)
 	s->tail = l->wal->tail;
 	s->durable = l->wal->durable;
 	s->flushes = l->wal->flushes;
+	s->full_waits = l->wal->full_waits;
 	pthread_mutex_unlock(&l->wal->lock);
 }

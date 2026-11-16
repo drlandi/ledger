@@ -3,7 +3,7 @@ mutant is a small bug planted in a copy of src/. A mutant is "killed"
 when the test that should notice it fails. Survivors mean
 the tests are blind to that bug.
 
-Usage: python3 tests/mutants.py [logic|race|crash|recovery]
+Usage: python3 tests/mutants.py [logic|race|crash|recovery|wal|reads|torn]
 """
 
 import os
@@ -134,9 +134,105 @@ RECOVERY_MUTANTS = [
      [("if (id != r->x.id)", "if (0)")]),
 ]
 
+# Gap 1: the buffer-full path of group commit. Judged by
+# test_groupcommit.py (fdatasync gate + 128-byte-buffer storms).
+FULL_LOOP = ("\twhile (w->len + n > LG_WAL_BUF - LG_COMMIT"
+             " && !atomic_load(&w->failed))")
+WAL_MUTANTS = [
+    ("buffer full: records waiting in the buffer are dropped", "wal.c",
+     [("\t\tw->full_waits++;\n\t\twal_step(w);",
+       "\t\tw->full_waits++;\n\t\twal_step(w);\n\t\tw->len = 0;")]),
+    ("buffer full: flushes without waiting for the running flush", "wal.c",
+     [("\t\tw->full_waits++;\n\t\twal_step(w);",
+       "\t\tw->full_waits++;\n\t\twal_flush(w);")]),
+    ("buffer full: checked once, not again after waiting", "wal.c",
+     [(FULL_LOOP, FULL_LOOP.replace("while", "if"))]),
+    ("no room kept for the commit record", "wal.c",
+     [("w->len + n > LG_WAL_BUF - LG_COMMIT", "w->len + n > LG_WAL_BUF")]),
+    ("batch boundary: records that arrived during the flush count as "
+     "durable", "wal.c",
+     [("w->durable = target;", "w->durable = w->tail;")]),
+    ("only one waiter woken after a flush", "wal.c",
+     [("pthread_cond_broadcast(&w->cond);",
+       "pthread_cond_signal(&w->cond);")]),
+    ("batch written without its commit record", "wal.c",
+     [("\tlg_wal_seal(w);", "\t;")]),
+    ("commit record names the wrong batch start", "wal_batch.c",
+     [("c.id = w->tail - w->len;", "c.id = w->tail;")]),
+]
+
+# Gap 3: answers given before the state they show is durable. Judged
+# by test_groupcommit.py.
+READ_MUTANTS = [
+    ("lg_balance returns before the log is durable", "account.c",
+     [("return (lg_settle(l, LG_OK, lsn));", "return (LG_OK);")]),
+    ("lg_balance notes the log end before it has the account lock",
+     "account.c",
+     [("\tlg_lock_acc(l, id);\n\t*out = l->acc[id].balance;\n"
+       "\tlsn = lg_tail(l);",
+       "\tlsn = lg_tail(l);\n\tlg_lock_acc(l, id);\n"
+       "\t*out = l->acc[id].balance;")]),
+    ("lg_lookup returns before the log is durable", "lookup.c",
+     [("return (lg_settle(l, rc, lsn));", "return (rc);")]),
+    ("lg_snapshot returns before the log is durable", "snapshot.c",
+     [("if (lg_settle(l, LG_OK, lsn) == LG_OK)", "if (1)")]),
+    ("lg_snapshot notes the log end before it has the locks", "snapshot.c",
+     [("\tlg_lock_all(l, s->count);\n\tsnap_copy(l, s);\n"
+       "\tlsn = lg_tail(l);",
+       "\tlsn = lg_tail(l);\n\tlg_lock_all(l, s->count);\n"
+       "\tsnap_copy(l, s);")]),
+    ("INSUFFICIENT_FUNDS answered before the debit behind it is durable",
+     "transfer.c",
+     [("\t\treturn (lg_reject(l, rc, lsn));", "\t\treturn (rc);")]),
+    ("id conflict (INVALID) answered before the original is durable",
+     "transfer.c",
+     [("if (old->amount != x->amount)\n"
+       "\t\treturn (lg_reject(l, LG_INVALID, lsn));",
+       "if (old->amount != x->amount)\n\t\treturn (LG_INVALID);")]),
+    ("answers derived from state wait only if they are OK or DUPLICATE",
+     "wal_util.c",
+     [("rc == LG_OK || rc == LG_DUPLICATE || lsn != 0",
+       "rc == LG_OK || rc == LG_DUPLICATE")]),
+]
+
+# Gap 2: torn tail or corruption. Judged by test_torn.py.
+TORN_MUTANTS = [
+    ("damage is cut wherever it is (the old rule)", "recover.c",
+     [("if (hdr == 1 && lg_scan_tail(w->crc, img, img->end) != 0)",
+       "if (0)")]),
+    ("bytes behind a damaged batch's own commit record are ignored",
+     "wal_batch.c",
+     [("return (-(r.x.id != end || p + n != img->size));",
+       "return (-(r.x.id != end));")]),
+    ("a commit record of another batch at the very end is ignored",
+     "wal_batch.c",
+     [("return (-(r.x.id != end || p + n != img->size));",
+       "return (-(p + n != img->size));")]),
+    ("tail scan cannot find a commit record behind a hole", "wal_batch.c",
+     [("\t\tp++;", "\t\tp += LG_REC_HDR + LG_LEN_XFER;")]),
+    ("a commit record is believed whatever batch start it names",
+     "wal_batch.c",
+     [("if (r.type == LG_REC_COMMIT && r.x.id != end)", "if (0)")]),
+    ("records without a commit record are replayed", "wal_batch.c",
+     [("\treturn (end);\n}", "\treturn (off);\n}")]),
+    ("a tail of exactly one full batch is refused", "recover.c",
+     [("img->size - img->end > LG_WAL_BUF",
+       "img->size - img->end >= LG_WAL_BUF")]),
+    ("commit records are replayed as if they were data records",
+     "recover.c",
+     [("\t\tif (r.type == LG_REC_COMMIT)\n\t\t\tcontinue ;",
+       "\t\tif (r.type == LG_REC_COMMIT && r.x.id == 0)\n"
+       "\t\t\tcontinue ;")]),
+]
+
+TINY = ["-DLG_WAL_BUF=128"]
 TOOL_SRC = {"driver": "tests/driver.c", "stress": "tests/stress.c",
             "crash_worker": "tests/crash_worker.c",
+            "crash_worker_tiny": "tests/crash_worker.c",
+            "gate": "tests/gate.c",
             "ledger": "cli/ledger_cli.c"}
+TOOL_FLAGS = {"driver": SAN, "crash_worker_tiny": ["-O2"] + TINY,
+              "gate": ["-O2", "-Wl,--wrap=fdatasync"] + TINY}
 
 
 def build(tools, name, fname, pairs):
@@ -155,7 +251,7 @@ def build(tools, name, fname, pairs):
     exes = []
     for tool in tools:
         exe = os.path.join(MUT, tool)
-        flags = SAN if tool == "driver" else ["-O2"]
+        flags = TOOL_FLAGS.get(tool, ["-O2"])
         subprocess.run(CC + flags + ["-I" + MUT, "-o", exe,
                                      os.path.join(ROOT, TOOL_SRC[tool])]
                        + srcs, check=True)
@@ -165,10 +261,15 @@ def build(tools, name, fname, pairs):
 
 def killed_by(test, env):
     res = subprocess.run(
-        [sys.executable, "-m", "unittest", "discover", "-s",
+        [sys.executable, "-m", "unittest", "discover", "-f", "-s",
          os.path.join(ROOT, "tests"), "-p", test],
         env=dict(os.environ, **env), capture_output=True, text=True)
     return res.returncode != 0
+
+
+def GC_ENV(e):
+    return {"GATE": e[0], "CRASH_WORKER_TINY": e[1], "LEDGER": e[2],
+            "CRASH_ITER": "30"}
 
 
 def main():
@@ -185,6 +286,12 @@ def main():
          lambda e: {"CRASH_WORKER": e[0], "LEDGER": e[1]}),
         ("recovery", RECOVERY_MUTANTS, ["ledger"], "test_recovery.py",
          lambda e: {"LEDGER": e[0]}),
+        ("wal", WAL_MUTANTS, ["gate", "crash_worker_tiny", "ledger"],
+         "test_groupcommit.py", GC_ENV),
+        ("reads", READ_MUTANTS, ["gate", "crash_worker_tiny", "ledger"],
+         "test_groupcommit.py", GC_ENV),
+        ("torn", TORN_MUTANTS, ["ledger"], "test_torn.py",
+         lambda e: {"LEDGER": e[0]}),
     ]
     # Fail fast if the core changed and a pattern no longer applies.
     for group, mutants, tools, test, env in groups:
@@ -199,6 +306,12 @@ def main():
     for group, mutants, tools, test, env in groups:
         if only and only != group:
             continue
+        # Control: the unchanged core, built and judged exactly like a
+        # mutant, must pass. Otherwise "killed" would mean nothing.
+        if killed_by(test, env(build(tools, "control", "ledger.c", []))):
+            sys.exit("control failed: the unchanged core does not pass "
+                     "%s in the mutant setup" % test)
+        print("passed    [%s] control: unchanged core" % group, flush=True)
         for name, fname, pairs in mutants:
             total += 1
             dead = killed_by(test, env(build(tools, name, fname, pairs)))

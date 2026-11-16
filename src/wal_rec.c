@@ -30,7 +30,8 @@ int	lg_hdr_check(const t_lg_img *img)
 ** Writes one record into out (at least LG_REC_MAX bytes) and returns
 ** its size. A create record travels in a t_lg_xfer too: id = account
 ** id, from = initial balance, to = flags; its body is the first 20
-** bytes of that struct. Byte order is the host's: little-endian only
+** bytes of that struct. A commit record carries its batch start in
+** id. Byte order is the host's: little-endian only
 ** (lg_wal_new refuses to run elsewhere).
 */
 size_t	lg_rec_encode(const uint32_t *tab, uint8_t *out, uint8_t type,
@@ -42,6 +43,8 @@ size_t	lg_rec_encode(const uint32_t *tab, uint8_t *out, uint8_t type,
 	len = LG_LEN_XFER;
 	if (type == LG_REC_CREATE)
 		len = LG_LEN_CREATE;
+	if (type == LG_REC_COMMIT)
+		len = LG_LEN_COMMIT;
 	memcpy(out, &len, 4);
 	out[LG_REC_HDR] = type;
 	memcpy(out + LG_REC_HDR + 1, x, len - 1);
@@ -57,6 +60,8 @@ static int	rec_shape_ok(uint32_t len, uint8_t type)
 		return (len == LG_LEN_CREATE);
 	if (type == LG_REC_XFER)
 		return (len == LG_LEN_XFER);
+	if (type == LG_REC_COMMIT)
+		return (len == LG_LEN_COMMIT);
 	return (0);
 }
 
@@ -78,7 +83,7 @@ size_t	lg_rec_decode(const uint32_t *tab, const uint8_t *p, uint64_t avail,
 		return (0);
 	memcpy(&len, p, 4);
 	memcpy(&want, p + 4, 4);
-	if (len != LG_LEN_CREATE && len != LG_LEN_XFER)
+	if (len != LG_LEN_CREATE && len != LG_LEN_XFER && len != LG_LEN_COMMIT)
 		return (0);
 	if (avail < LG_REC_HDR + len)
 		return (0);

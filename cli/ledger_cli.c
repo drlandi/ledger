@@ -139,12 +139,31 @@ static int	cmd_report(t_ledger *l, int dump)
 	return (rc == LG_OK ? 0 : 3);
 }
 
+/* Says why a log was refused; nothing in the file was changed. */
+static const char	*why_text(int why)
+{
+	if (why == LG_WHY_FOREIGN)
+		return (" (not a ledger log; file left untouched)");
+	if (why == LG_WHY_LONG_TAIL)
+		return (" (more unreadable bytes at the end than one interrupted"
+			" write can explain; file left untouched)");
+	if (why == LG_WHY_BEHIND)
+		return (" (damage in front of data that was written later:"
+			" acknowledged transfers would be lost by cutting;"
+			" file left untouched)");
+	if (why == LG_WHY_RULES)
+		return (" (a committed record breaks the ledger's rules;"
+			" file left untouched)");
+	return ("");
+}
+
 int	main(int argc, char **argv)
 {
 	t_lg_config	cfg;
 	t_ledger	*l;
 	t_lg_rc		rc;
 	int			ret;
+	int			why;
 	const char	*sync;
 
 	if (argc < 3)
@@ -152,14 +171,16 @@ int	main(int argc, char **argv)
 	memset(&cfg, 0, sizeof(cfg));
 	cfg.max_accounts = MAX_ACCOUNTS;
 	cfg.wal_path = argv[1];
+	why = LG_WHY_NONE;
+	cfg.why = &why;
 	sync = getenv("LEDGER_SYNC");
 	if (sync && !strcmp(sync, "process"))
 		cfg.sync_mode = LG_SYNC_PROCESS;
 	rc = lg_open(&cfg, &l);
 	if (rc != LG_OK)
 	{
-		fprintf(stderr, "ledger: cannot open %s: %s\n", argv[1],
-			lg_rc_name(rc));
+		fprintf(stderr, "ledger: cannot open %s: %s%s\n", argv[1],
+			lg_rc_name(rc), why_text(why));
 		return (3);
 	}
 	if (!strcmp(argv[2], "create"))

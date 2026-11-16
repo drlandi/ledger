@@ -2,3 +2,4 @@ build/
 __pycache__/
 *.pyc
 .hypothesis/
+model/MC_TTrace_*
