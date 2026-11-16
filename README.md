@@ -89,6 +89,11 @@ incomplete last batch is a torn write and is cut off. Damage with a
 later batch behind it is corruption of acknowledged data: the ledger
 refuses to open, leaves the file untouched and says why.
 
+**Model.** `model/Ledger.tla` is a TLA+ model of transfer, group
+commit, crash and recovery, checked with TLC at small sizes
+(`make model`); see `DESIGN.md` section 10 for what that does and does
+not show.
+
 `DESIGN.md` has the full reasoning, a decision log (what was rejected
 and why), the test evidence per milestone, and a list of what is not
 verified.
@@ -109,6 +114,7 @@ per invariant (`tests/test_invariants.py`).
 | `make test-crash` | `kill -9` harness in four configurations; disk-full fail-stop; `fdatasync` counted with strace | I1-I6 across crashes |
 | `make crash-long` | 1000 kills | I1-I6 across crashes |
 | `make mutants` | plants 65 bugs in a copy of the core, one at a time; each must make a test fail | are the tests able to fail? |
+| `make model` | TLC checks the TLA+ model of the design: 10 configurations, up to 10 million states; three deliberately broken variants must each produce a counterexample (needs Java; fetches `tla2tools.jar` once; not part of `make test`) | I1-I5 and the read rule, for the design at small sizes |
 | `make norm` | norminette on the core | 42 Norm |
 | `make test-property` | optional, needs `hypothesis`: same property as test-diff, with shrinking of failing cases | rules |
 
@@ -126,6 +132,7 @@ make crash-long        1000 kills, 497,180 transfers committed, 91 damaged logs 
 make demo              400 kills, 1,199,324 transfers committed, I1-I6 held 400 of 400
 make mutants           65/65 planted bugs caught; the unchanged core passes every mutant setup
 make norm              OK (only the 42 file header is not stamped)
+make model             10 TLC runs as expected: 4 clean (up to 10,182,954 states), 3 planted bugs found, 3 reachability checks
 ```
 
 ## Benchmarks
@@ -239,6 +246,7 @@ the product.
 | `tests/walfmt.py` | the log format and the cut-or-refuse rule, implemented a second time in Python |
 | `tests/gate.c`, `tests/test_groupcommit.py` | the fdatasync gate and the buffer-full storms |
 | `tests/test_torn.py` | torn tail vs. corruption |
+| `model/` | TLA+ model and TLC configurations |
 | `tests/mutants.py` | mutation check |
 | `tests/bench.py` | benchmarks |
 | `DESIGN.md` | design, decision log, evidence, interview notes |
@@ -248,7 +256,8 @@ the product.
 
 Linux, a C11 compiler (gcc or clang) with pthreads, GNU make,
 Python 3.8+ (standard library only). Optional: `strace` (one test is
-skipped without it), `norminette` (`make norm`). ThreadSanitizer and
+skipped without it), `norminette` (`make norm`), Java 11+ for
+`make model`. ThreadSanitizer and
 AddressSanitizer come with the compiler.
 
 ## Known limitations

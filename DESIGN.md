@@ -863,6 +863,136 @@ Reads (gap 3):
 - A lookup that finds nothing makes no claim that can be checked after
   a crash, except against the same thread's earlier `OK`.
 
+## 10. A formal model of the design (Part 2)
+
+Route taken: TLA+, checked with TLC (version 1.8.0; Java was
+available and `tla2tools.jar` could be fetched). The Python fallback
+was not needed. `make model` runs everything below in about 5 minutes
+on 4 cores.
+
+What this is: `model/Ledger.tla` describes the *design* (who may do
+what, in which order, and what survives a crash) in about 250 lines.
+TLC then tries every possible interleaving of the actions, including a
+crash at every possible moment, for one small instance, and checks the
+invariants in every state it can reach.
+
+What this is not: a check of the C code. The model can be right while
+the C code has a bug the model does not contain (a wrong pointer, a
+lost wake-up), and the C code is only "the model" as far as the
+mapping below is faithful, which no tool checked.
+
+### The instance (`model/MC.tla`)
+
+2 accounts (A = 2, B = 0), 2 threads (one configuration with 3), up to
+3 operations per thread, up to 1 crash (one configuration with 2), a
+commit buffer of 1 record (so the buffer-full path is taken all the
+time) or 2. Three requests, each of which any thread may send any
+number of times:
+
+| | Request | Why it is there |
+|---|---|---|
+| r1 | id 1: A -> B, 1 | plain transfer; retries give `DUPLICATE` |
+| r2 | id 2: B -> A, 1 | only possible after r1 delivered: B starts empty. If r2 survived a crash without r1, B would be negative |
+| r3 | id 1: A -> B, 2 | same id as r1, other amount: `INVALID` once either is applied; whichever of r1 / r3 comes first wins |
+
+### Actions and the C code they stand for
+
+| Spec action | Meaning | C code |
+|---|---|---|
+| `Begin(t, r)` | take the id lock and both account locks | `lg_transfer` -> `lg_lock_id`; `xfer_locked` -> `lg_lock_pair` |
+| `Apply(t)` | under the locks: decide; if `OK`, append the record to the buffer (blocked while the buffer is full), change both balances, remember the id; release the locks; note the LSN to wait for | `xfer_replay`, `xfer_check`, `xfer_apply` (`lg_log` -> `lg_wal_append` with its `while` loop), `lg_reject`, the unlocks |
+| `Read(t, a)` | copy a balance under the account lock, note the log end | `lg_balance` |
+| `Return(t)` | hand the answer to the caller once the log is durable up to the noted LSN | `lg_settle` -> `lg_wal_sync` |
+| `FlushStart` | the leader takes the whole buffer and swaps in an empty one | `wal_flush` up to the unlock (`lg_wal_seal`, buffer swap) |
+| `FlushWrite` | the batch is in the page cache | `write` in `wal_write` |
+| `FlushSync` | `fdatasync` returned; the batch is durable; waiters wake | `fdatasync` in `wal_write`; `w->durable = target`; `pthread_cond_broadcast` |
+| `Crash` | memory gone, calls in progress never return; a written but unsynced batch survives whole or not at all | `kill -9` (survives) or power loss (either) |
+| `Recover` | rebuild memory by replaying the complete batches | `lg_recover`: `lg_scan_commits`, `replay`, `lg_wal_start` |
+
+### Invariants
+
+| Spec | Brief | Says |
+|---|---|---|
+| `I1` | I1 | sum of balances = sum of initial balances |
+| `I2` | I2 | no balance negative in memory, and none after any prefix of the log (no transfer without the one that funded it) |
+| `I3` | I3 | no id twice in the log |
+| `I4` | I4 | memory = initial state + every logged transfer taken whole; the id table = the ids in the log |
+| `I5`, `AckedIsDurable` | I5 | everything answered `OK` or `DUPLICATE` is on disk: after a crash (`I5`), and already at every moment before (`AckedIsDurable`) |
+| `Observed`, `ObservedAfterCrash` | gap 3 | every balance, `INSUFFICIENT_FUNDS` and id-conflict `INVALID` a client was given is explained by the durable log up to the log end at the moment it looked |
+| `Batches` | group commit | no batch larger than the buffer, no empty batch |
+| (none) | I6 | recovery is a function of the disk in the model, so determinism holds by construction. It is **not** a checked property here; the C tests check it (`recover_and_judge`) |
+
+TLC also checks for deadlock: a reachable state in which no action is
+possible and the work is not finished.
+
+### Results (`make model`)
+
+```
+ok   ok_buf1                    1097618 distinct states, depth 27, no invariant violated, no deadlock
+ok   ok_buf2                    1281558 distinct states, depth 27, no invariant violated, no deadlock
+ok   ok_2crashes                102859 distinct states, depth 23, no invariant violated, no deadlock
+ok   ok_3threads                10182954 distinct states, depth 27, no invariant violated, no deadlock
+ok   reach_full_buffer          reachable (probe violated, trace of 12 states)
+ok   reach_full_buffer_in_flight reachable (probe violated, trace of 7 states)
+ok   unreachable_with_2_threads 1097618 distinct states, depth 27, no invariant violated, no deadlock
+ok   bug_ack_before_flush       TLC found: invariant I5 violated, trace of 5 states
+ok   bug_read_before_durable    TLC found: invariant ObservedAfterCrash violated, trace of 6 states
+ok   bug_reject_before_durable  TLC found: invariant ObservedAfterCrash violated, trace of 7 states
+```
+
+The deliberately broken variants (constant `Bug`; `python3
+model/check.py build/tla2tools.jar -v` prints the traces):
+
+- `AckBeforeFlush`: `Return` does not wait for `OK`/`DUPLICATE`. TLC's
+  counterexample, shortened to what changes:
+
+  ```
+  Begin    t takes the locks for r1
+  Apply    buf = <<r1>>            (in memory only)
+  Return   acks = { r1: OK }       (told the client)
+  Crash    disk = <<>>             (r1 is gone; I5 violated)
+  ```
+
+- `ReadBeforeDurable`: a balance is returned without waiting. Trace:
+  r1 applied to the buffer; another thread reads A = 1 and returns;
+  crash; the disk is empty, so the durable log only ever had A = 2.
+- `RejectBeforeDurable`: the defect fixed by D27. Trace: r3 (id 1,
+  amount 2) is applied to the buffer; r1 (id 1, amount 1) is answered
+  `INVALID` at once; crash; r3 never happened, so nothing explains
+  that `INVALID`. (This model was written after the fix; it confirms
+  the defect, it did not find it.)
+
+The probes are the check on the checker. An invariant that holds in
+every reachable state means little if the interesting states are not
+reachable. `ProbeBlocked` and `ProbeInFlight` claim "this situation
+never occurs" and TLC must refute them. The first version of the
+probe was *not* refuted, which showed something true about the small
+instance: with two threads, a thread can never be stuck in front of a
+full buffer while another batch is in flight (it takes one thread to
+own the batch in flight, one to own the buffered record, one to be
+stuck). That is exactly the situation `tests/gate.c` builds, so the
+3-thread configuration was added, and
+`unreachable_with_2_threads` keeps the observation on record.
+
+### What the model does not show
+
+- Anything about the C code (see above).
+- Gap 2. There are no bytes, checksums, torn records or bit rot in the
+  model. A crash loses only unsynced batches, whole. The cut-or-refuse
+  rule is tested by `tests/test_torn.py` and the harness, not modelled.
+- Lock ordering and deadlock between account locks: `Begin` takes all
+  its locks in one step. (Deadlock freedom of the lock order is the
+  argument of section 5 and the watchdog test.)
+- Which thread leads a flush, lost wake-ups, spurious wake-ups: the
+  flush is three global steps.
+- Account creation, snapshots, lookups, I/O errors and fail-stop,
+  `LG_SYNC_PROCESS`, overdraft accounts, integer overflow.
+- Liveness (that every call eventually returns): only safety
+  invariants and deadlock are checked, no fairness.
+- Sizes beyond the instance. Small-scope checking finds most design
+  errors with a handful of threads and requests; it is not a proof for
+  all sizes.
+
 ## Decision log
 
 | # | Decision | Chosen | Rejected | Why |
@@ -897,6 +1027,7 @@ Reads (gap 3):
 | D27 | Rejections decided by looking at state | `INSUFFICIENT_FUNDS`, and `INVALID` for an id already used with other values, wait for the log to be durable up to the moment they looked, like a read (D20) | Answering at once (the behaviour until this round) | Found while writing the gap-3 tests: a rejection can be caused by a debit that is still in the log buffer. Crash, the debit is gone, and the caller holds an answer the recovered ledger never could have given. Not a lost `OK`, but the same class of lie as D20. Cost: such a rejection may wait for one flush. `UNKNOWN_ACCOUNT` and the stateless `INVALID`s (amount <= 0, same account) do not wait: they depend on nothing a crash can take back. |
 | D28 | How to test "nothing observable before durable" | (a) `tests/gate.c`: the linker option `--wrap=fdatasync` routes the ledger's `fdatasync` to a test function that blocks until the test releases it, so the test decides when each batch becomes durable. (b) In the crash harness every answer carries the `durable` offset the ledger reported right after the call, and must be explainable by the log up to that offset | Only more kill -9 runs | A kill has to land in a window of a few hundred microseconds to expose such a bug; the gate makes the window as long as the test likes, with no timing luck, and no change to the core (not even a test hook). (b) checks the rule on every call of every run, kill or no kill. |
 | D29 | Why the open failed | `t_lg_config.why` (optional `int *`) receives a reason code; the CLI prints a sentence | A global "last error"; only `CORRUPT` | "Refuse and say why". A global is forbidden by the Norm and wrong with two ledgers in one process. |
+| D30 | Formal model (Part 2) | TLA+ spec checked with TLC, `model/` | A hand-written Python state enumerator (the fallback in the brief) | Java and `tla2tools.jar` were available. The model is of the design at small bounds, not of the C code. |
 
 ## Decisions in plain language
 

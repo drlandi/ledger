@@ -40,13 +40,19 @@ transfer ledger in C, correctness shown by tests. Design: `DESIGN.md`.
     `make test-groupcommit`.
   - `make mutants`: 65/65 (41 old, 24 new) plus a control per group.
     `make test` OK (about 8 min). `make crash-long` 1000/1000.
-- Part 1b done: DESIGN "Decisions in plain language" (D3, D4, the
-  three gaps). Not yet done: Part 2
-  (TLA+ model; `model/` holds an unchecked draft if present).
+- Part 1b: DESIGN "Decisions in plain language" (D3, D4, the three
+  gaps).
+- Part 2: TLA+ model `model/Ledger.tla`, instance `model/MC.tla`,
+  checked with TLC by `make model` (about 5 min; needs Java; fetches
+  `build/tla2tools.jar` once). 4 clean configurations (up to 10.2M
+  states), 3 planted bugs each found, 3 reachability probes. DESIGN
+  section 10 maps actions to C functions and lists what the model
+  does not show (no bytes: gap 2 is not modelled; not the C code).
 
 ## Next
 
 Open items, in order of value:
+model the commit-record rule (torn / rotten batches) in TLA+;
 a batch tag per data record and a generation number in the commit
 record (the two "known limit" tests in `tests/test_torn.py` would then
 flip to "refuse"); a repair tool for a refused log; checkpoint + log

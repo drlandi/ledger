@@ -126,6 +126,19 @@ test-property: $(B)/driver
 mutants: all
 	$(PY) tests/mutants.py
 
+# Part 2: TLC checks the TLA+ model of the design (model/). Needs Java;
+# fetches the TLA+ tools (free, MIT licence) once. Not part of
+# `make test`: the ledger and its tests need neither.
+TLA_JAR	?= $(B)/tla2tools.jar
+TLA_URL	= https://github.com/tlaplus/tlaplus/releases/download/v1.8.0/tla2tools.jar
+
+$(TLA_JAR):
+	@mkdir -p $(B)
+	curl -sSL -o $@ $(TLA_URL)
+
+model: $(TLA_JAR)
+	$(PY) model/check.py $(TLA_JAR)
+
 # 42 Norm. The 42 file header carries a student login and e-mail, so it
 # is left for the author to stamp; every other rule must pass.
 norm:
@@ -139,4 +152,4 @@ test: test-model test-diff test-stress test-recovery test-crash \
 clean:
 	rm -rf $(B) tests/__pycache__
 
-.PHONY: all test test-model test-diff test-stress test-recovery test-crash test-groupcommit crash-long demo bench test-property mutants norm clean
+.PHONY: all test test-model test-diff test-stress test-recovery test-crash test-groupcommit crash-long demo bench test-property mutants model norm clean
