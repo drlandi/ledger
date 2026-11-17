@@ -1,5 +1,7 @@
 # ledger
 
+[![CI](https://github.com/drlandi/ledger/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/drlandi/ledger/actions/workflows/ci.yml)
+
 A small money-transfer ledger in C whose correctness is demonstrated
 by tests that try to break it: random transfers from many threads,
 the process killed with `kill -9` at random moments, the unsynced end
