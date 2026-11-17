@@ -84,13 +84,25 @@ static void	derive(uint64_t id, t_lg_xfer *x)
 	x->amount = 1 + (int64_t)(mix(h + 1) % 300);
 }
 
-/* Fail-stop: once the log failed, nothing may succeed. */
-static void	died(const t_lg_xfer *x)
+/*
+** Fail-stop: once the log failed, nothing may succeed. The probe
+** transfer must be valid input: a transfer that is itself invalid
+** (amount 0, from == to) is answered LG_INVALID, correctly, before the
+** ledger state is looked at. The failed call's own transfer cannot be
+** reused, since read_snapshot() has no transfer and passes zeros.
+*/
+static void	died(const t_lg_xfer *failed)
 {
+	t_lg_xfer	x;
 	int64_t		bal;
 	uint64_t	n;
 
-	if (lg_transfer(g_l, x) != LG_ERROR
+	(void)failed;
+	x.id = UINT64_MAX;
+	x.from = 0;
+	x.to = 1;
+	x.amount = 1;
+	if (lg_transfer(g_l, &x) != LG_ERROR
 		|| lg_balance(g_l, 0, &bal) != LG_ERROR
 		|| lg_create(g_l, 0, 0, &n) != LG_ERROR)
 		_exit(5);
